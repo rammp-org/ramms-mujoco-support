@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "0.1",
 	"FriendlyName": "RAMMS Mujoco Support",
-	"Description": "MuJoCo-based control for RAMMS — end-effector IK teleoperation for the URLab Kinova Gen3 + gripper articulation.",
+	"Description": "RAMMS support utilities, classes, and content for MuJoCo-based simulation — including end-effector IK teleoperation for the URLab Kinova Gen3 + gripper articulation.",
 	"Category": "Ramms",
 	"CreatedBy": "RAMMS",
 	"EnabledByDefault": true,
