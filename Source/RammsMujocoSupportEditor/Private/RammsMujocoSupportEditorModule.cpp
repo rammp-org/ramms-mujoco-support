@@ -23,8 +23,10 @@
 #include "FileHelpers.h"
 #include "Modules/ModuleManager.h"
 #include "MuJoCo/Components/Actuators/MjActuator.h"
+#include "MuJoCo/Components/Actuators/MjPositionActuator.h"
 #include "MuJoCo/Components/Bodies/MjBody.h"
 #include "MuJoCo/Components/Constraints/MjEquality.h"
+#include "MuJoCo/Components/Defaults/MjDefault.h"
 #include "MuJoCo/Components/Geometry/MjGeom.h"
 #include "MuJoCo/Components/Physics/MjInertial.h"
 #include "MuJoCo/Components/Joints/MjFreeJoint.h"
@@ -260,6 +262,7 @@ static void GenerateChaosRig(UBlueprint* BP)
 	CollectRig(BP, Bodies, Equalities, ParentOf);
 
 	TMap<FString, UMjActuator*> ActuatorByJoint;
+	TMap<FString, USCS_Node*> DefaultNodeByClass;   // MJCF default class -> node
 	for (USCS_Node* Node : SCS->GetAllNodes())
 	{
 		if (UMjActuator* Act = Cast<UMjActuator>(Node->ComponentTemplate))
@@ -269,7 +272,41 @@ static void GenerateChaosRig(UBlueprint* BP)
 				ActuatorByJoint.Add(Act->TargetName, Act);
 			}
 		}
+		if (UMjDefault* Def = Cast<UMjDefault>(Node->ComponentTemplate))
+		{
+			DefaultNodeByClass.Add(Def->ClassName, Node);
+		}
 	}
+	// Class-based actuators (the gen3 arm) carry EMPTY gainprm/biasprm on
+	// the actuator itself — the values live on an actuator template nested
+	// under the <default class> (possibly up a parent chain). Resolve them.
+	auto ResolveActuatorParams = [&DefaultNodeByClass](const UMjActuator* Act) -> const UMjActuator* {
+		if (Act->gainprm.Num() > 0 || Act->biasprm.Num() > 0)
+		{
+			return Act;
+		}
+		FString Cls = Act->MjClassName;
+		for (int32 Hop = 0; Hop < 4 && !Cls.IsEmpty(); ++Hop)
+		{
+			USCS_Node* const* DefNode = DefaultNodeByClass.Find(Cls);
+			if (!DefNode)
+			{
+				break;
+			}
+			for (USCS_Node* Child : (*DefNode)->GetChildNodes())
+			{
+				if (const UMjActuator* DA = Cast<UMjActuator>(Child->ComponentTemplate))
+				{
+					if (DA->gainprm.Num() > 0 || DA->biasprm.Num() > 0)
+					{
+						return DA;
+					}
+				}
+			}
+			Cls = Cast<UMjDefault>((*DefNode)->ComponentTemplate)->ParentClassName;
+		}
+		return Act;
+	};
 
 	TMap<FString, USCS_Node*> BodyByName;   // Mj element name -> node
 	for (TPair<USCS_Node*, FRigBody>& Pair : Bodies)
@@ -527,8 +564,14 @@ static void GenerateChaosRig(UBlueprint* BP)
 			if (ActPtr)
 			{
 				const UMjActuator* Act = *ActPtr;
-				const float Kp = Act->gainprm.Num() ? Act->gainprm[0] : 0.f;
-				const float Kv = Act->biasprm.Num() >= 3 ? -Act->biasprm[2] : 0.f;
+				const UMjActuator* Params = ResolveActuatorParams(Act);
+				const float Kp = Params->gainprm.Num() ? Params->gainprm[0] : 0.f;
+				const float Kv = Params->biasprm.Num() >= 3 ? -Params->biasprm[2] : 0.f;
+				// URLab re-export flattens every actuator to <general>
+				// (all import as UMjGeneralActuator) — detect a position
+				// servo by its bias term: biasprm = [0, -kp, -kv].
+				const bool bPositionServo = Cast<UMjPositionActuator>(Act) != nullptr
+					|| (Params->biasprm.Num() >= 2 && Params->biasprm[1] < -KINDA_SMALL_NUMBER);
 				if (bSlide)
 				{
 					// position servo (leadscrew): clamp for ~60 Hz stability
@@ -539,6 +582,24 @@ static void GenerateChaosRig(UBlueprint* BP)
 					Switch->DriveJoints.Add(*JointMjName);
 					Switch->DriveConstraints.Add(*CName);
 					Switch->DriveIsLinear.Add(true);
+					Switch->DriveIsPosition.Add(true);
+				}
+				else if (bHinge && bPositionServo)
+				{
+					// MJCF `position` actuator on a hinge (arm servos):
+					// orientation-hold PD, or the arm free-falls and flails
+					// under Chaos (velocity damping alone holds nothing).
+					// N*m/rad -> kg*cm^2/s^2 per rad needs x1e4.
+					CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
+					CI.SetOrientationDriveTwistAndSwing(true, false);
+					CI.SetAngularVelocityDriveTwistAndSwing(true, false);
+					CI.SetAngularDriveParams(
+						FMath::Clamp(Kp * 1e4f, 1e5f, 5e7f),
+						FMath::Clamp(Kv * 1e4f, 1e4f, 5e6f), 0.f);
+					Switch->DriveJoints.Add(*JointMjName);
+					Switch->DriveConstraints.Add(*CName);
+					Switch->DriveIsLinear.Add(false);
+					Switch->DriveIsPosition.Add(true);
 				}
 				else if (bHinge)
 				{
@@ -551,6 +612,7 @@ static void GenerateChaosRig(UBlueprint* BP)
 					Switch->DriveJoints.Add(*JointMjName);
 					Switch->DriveConstraints.Add(*CName);
 					Switch->DriveIsLinear.Add(false);
+					Switch->DriveIsPosition.Add(false);
 				}
 			}
 		}

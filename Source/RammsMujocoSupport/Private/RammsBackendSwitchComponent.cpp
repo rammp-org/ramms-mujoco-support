@@ -200,6 +200,12 @@ void URammsBackendSwitchComponent::SetJointCommand(FName Joint, float Value)
 				// metres -> cm along the constraint's X (the slide axis)
 				C->SetLinearPositionTarget(FVector(Value * 100.f, 0.f, 0.f));
 			}
+			else if (DriveIsPosition.IsValidIndex(Idx) && DriveIsPosition[Idx])
+			{
+				// radians -> orientation target about the twist axis (X)
+				C->SetAngularOrientationTarget(
+					FRotator(0.f, 0.f, FMath::RadiansToDegrees(Value)));
+			}
 			else
 			{
 				// rad/s -> rev/s about the twist axis
