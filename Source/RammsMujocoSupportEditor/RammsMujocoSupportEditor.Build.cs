@@ -27,6 +27,7 @@ public class RammsMujocoSupportEditor : ModuleRules
 			"SlateCore",
 			"ToolMenus",
 			"UnrealEd",
+			"AssetRegistry",
 			"URLab",
 		});
 	}

@@ -22,6 +22,9 @@ public class RammsMujocoSupport : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
+			// Ramms.Panel debug joint panel (Slate window)
+			"Slate",
+			"SlateCore",
 		});
 	}
 }

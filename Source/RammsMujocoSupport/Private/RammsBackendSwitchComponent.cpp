@@ -3,7 +3,10 @@
 #include "RammsBackendSwitchComponent.h"
 
 #include "Components/PrimitiveComponent.h"
+#include "EngineUtils.h"
+#include "Logging/MessageLog.h"
 #include "GameFramework/Actor.h"
+#include "PhysicsEngine/BodyInstance.h"
 #include "MuJoCo/Components/Actuators/MjActuator.h"
 #include "MuJoCo/Components/MjComponent.h"
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
@@ -75,6 +78,12 @@ static bool NameInRecorded(const FName& Actual, const TArray<FName>& Recorded)
 void URammsBackendSwitchComponent::ApplyChaos()
 {
 	AActor* Owner = GetOwner();
+	// NOTE on solver iterations: raising the global cvars
+	// (p.Chaos.Solver.Iterations.Position 30-50) was tried against the
+	// pin-stretch leak and made the loaded strokes MORE violent (stiffer
+	// loop enforcement stores bigger internal forces that release
+	// dynamically: rear+ went from a mild tip to a 90 m/s launch). The
+	// per-body 32/4 counts below are the stable calibration.
 	// Only rig bodies may collide. URLab leaves other collidable primitives
 	// on the actor (e.g. the MjArticulation query shell): simulated bodies
 	// spawn inside that blocking shell and the depenetration shoves them
@@ -91,14 +100,38 @@ void URammsBackendSwitchComponent::ApplyChaos()
 			}
 		}
 	}
+	TArray<UPrimitiveComponent*> RigPrims;
+	Owner->GetComponents(RigPrims);
 	for (int32 BodyIdx = 0; BodyIdx < ChaosBodyComponents.Num(); ++BodyIdx)
 	{
 		const FName& Name = ChaosBodyComponents[BodyIdx];
-		TArray<UPrimitiveComponent*> Prims;
-		Owner->GetComponents(Prims);
-		for (UPrimitiveComponent* Prim : Prims)
+		// Exact name first, ONE component per recorded body: the gripper's
+		// shared-asset viz names suffix-match across left/right, and the old
+		// match-all loop applied each recorded body's mass to every sibling
+		// (last writer won, order-dependent).
+		UPrimitiveComponent* Match = nullptr;
+		for (UPrimitiveComponent* Prim : RigPrims)
 		{
+			if (Prim->GetFName() == Name)
+			{
+				Match = Prim;
+				break;
+			}
+		}
+		for (UPrimitiveComponent* Prim : RigPrims)
+		{
+			if (Match)
+			{
+				break;
+			}
 			if (NameMatchesRecorded(Prim->GetFName(), Name))
+			{
+				Match = Prim;
+			}
+		}
+		{
+			UPrimitiveComponent* Prim = Match;
+			if (Prim)
 			{
 				Prim->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 				Prim->SetCollisionProfileName(TEXT("PhysicsActor"));
@@ -123,7 +156,18 @@ void URammsBackendSwitchComponent::ApplyChaos()
 				const float Mass = BodyMasses.IsValidIndex(BodyIdx) ? BodyMasses[BodyIdx] : 0.f;
 				if (Mass > 0.001f)
 				{
-					Prim->SetMassOverrideInKg(NAME_None, Mass, true);
+					// Chaos-side floor: authored gram-scale gripper links are
+					// physically real but give ~400:1 constraint mass ratios
+					// the 60 Hz solver can't hold. Gripper (arm_) links use a
+					// LIGHTER 0.05 kg floor: the 0.15 floor made the finger
+					// chain ~8x its real weight, which forced anti-sag spring
+					// drives strong enough to overconstrain the underactuated
+					// spring_link/follower side (user: "secondary links can't
+					// move when the motors activate"). 0.05 holds rest with a
+					// 3x softer spring that yields on close.
+					const float Floor =
+						Name.ToString().StartsWith(TEXT("arm_")) ? 0.05f : 0.15f;
+					Prim->SetMassOverrideInKg(NAME_None, FMath::Max(Mass, Floor), true);
 				}
 				else if (Prim->GetMass() < 0.1f)
 				{
@@ -131,6 +175,48 @@ void URammsBackendSwitchComponent::ApplyChaos()
 					// (URLab's MassInKgOverride is a blanket 100 kg default,
 					// not per-body data — using it put the robot at 5 t.)
 					Prim->SetMassOverrideInKg(NAME_None, 2.f, true);
+				}
+				// MJCF gives the small linkage pieces joint damping (50-500)
+				// that never reached Chaos: undamped they windmill about
+				// their closure pins and pump energy into the assembly
+				// (user-observed free-spinning aux linkages). Body-level
+				// damping is the Chaos-native equivalent. Wheels and arm
+				// links are excluded — wheels must roll freely and the arm
+				// has its own PD drives.
+				const FString BodyName = Name.ToString();
+				const bool	  bLinkagePiece = !BodyName.StartsWith(TEXT("arm_"))
+					&& !BodyName.Contains(TEXT("wheel"))
+					&& (BodyName.Contains(TEXT("linkage")) || BodyName.Contains(TEXT("rod"))
+						|| BodyName.Contains(TEXT("pivot")) || BodyName.Contains(TEXT("dampener"))
+						|| BodyName.Contains(TEXT("swing_arm")) || BodyName.Contains(TEXT("suspension")));
+				if (BodyName.Contains(TEXT("wheel")) && !BodyName.StartsWith(TEXT("arm_")))
+				{
+					// Rolling resistance (MJCF damping 0.3-0.5 + frictionloss
+					// equivalent): without it the wheels coast forever on any
+					// settle impulse and the chair slides around at rest.
+					Prim->SetAngularDamping(0.5f);
+				}
+				if (bLinkagePiece)
+				{
+					Prim->SetAngularDamping(10.f);
+					Prim->SetLinearDamping(1.f);
+					// Chaos's iterative solver cannot push loop forces
+					// through gram-scale links into a 200 kg chassis (the
+					// front chain moved at single-N pin forces while MuJoCo's
+					// direct solver transmits ~250 N there). Heavier links
+					// keep the mass ratio solvable; the real parts are steel.
+					if (Prim->GetMass() < 3.f)
+					{
+						Prim->SetMassOverrideInKg(NAME_None, 3.f, true);
+					}
+				}
+				// More solver iterations for every rig body: the closure
+				// loops are long constraint chains; the default 8/1 leaves
+				// them mushy (loop force starvation).
+				if (FBodyInstance* BI = Prim->GetBodyInstance())
+				{
+					BI->PositionSolverIterationCount = 32;
+					BI->VelocitySolverIterationCount = 4;
 				}
 			}
 		}
@@ -141,6 +227,15 @@ void URammsBackendSwitchComponent::ApplyChaos()
 	TArray<UStaticMeshComponent*> Meshes;
 	Owner->GetComponents(Meshes);
 	auto FindMesh = [&Meshes](const FName& N) -> UStaticMeshComponent* {
+		// Exact first: shared-asset viz names ("Viz_arm_2f85_follower1..3")
+		// suffix-match each other across left/right bodies.
+		for (UStaticMeshComponent* M : Meshes)
+		{
+			if (M->GetFName() == N)
+			{
+				return M;
+			}
+		}
 		for (UStaticMeshComponent* M : Meshes)
 		{
 			if (NameMatchesRecorded(M->GetFName(), N))
@@ -168,50 +263,292 @@ void URammsBackendSwitchComponent::ApplyChaos()
 	// against the fresh bodies.
 	TArray<UPhysicsConstraintComponent*> Constraints;
 	Owner->GetComponents(Constraints);
+	TArray<UStaticMeshComponent*> BodyComps;
+	Owner->GetComponents(BodyComps);
+	int32 NumInited = 0;
 	for (UPhysicsConstraintComponent* C : Constraints)
 	{
-		if (NameInRecorded(C->GetFName(), ChaosConstraintComponents))
+		int32 RecIdx = INDEX_NONE;
+		for (int32 i = 0; i < ChaosConstraintComponents.Num(); ++i)
 		{
-			C->InitComponentConstraint();
+			if (NameMatchesRecorded(C->GetFName(), ChaosConstraintComponents[i]))
+			{
+				RecIdx = i;
+				break;
+			}
+		}
+		if (RecIdx == INDEX_NONE)
+		{
+			continue;
+		}
+		// Editor-side construction reruns (flipping Backend in the Details
+		// panel, moving the actor, etc.) can DISPLACE constraint components
+		// — the user observed constraints jumping far outside the robot
+		// after a backend switch, and frames initialized from those poses
+		// produce garbage joints. Re-derive the world frame from the
+		// recorded child-body-local transform before initializing.
+		if (ConstraintLocalFrames.IsValidIndex(RecIdx)
+			&& ConstraintChildBodies.IsValidIndex(RecIdx))
+		{
+			// EXACT name first: the gripper's shared-asset viz components
+			// ("Viz_arm_2f85_follower", "...follower1..3" across left AND
+			// right) all suffix-match each other's recorded names, and a
+			// first-suffix-match here derived the LEFT pin's frame from the
+			// RIGHT follower — every gripper pin initialized 4.8 cm off
+			// (fingers spawned deformed: followers +51 deg, couplers -15).
+			UStaticMeshComponent* Child = nullptr;
+			for (UStaticMeshComponent* B : BodyComps)
+			{
+				if (B->GetFName() == ConstraintChildBodies[RecIdx])
+				{
+					Child = B;
+					break;
+				}
+			}
+			for (UStaticMeshComponent* B : BodyComps)
+			{
+				if (Child)
+				{
+					break;
+				}
+				if (NameMatchesRecorded(B->GetFName(), ConstraintChildBodies[RecIdx]))
+				{
+					Child = B;
+				}
+			}
+			if (Child)
+			{
+				C->SetWorldTransform(
+					ConstraintLocalFrames[RecIdx] * Child->GetComponentTransform());
+			}
+		}
+		C->InitComponentConstraint();
+		++NumInited;
+	}
+	if (NumInited < ChaosConstraintComponents.Num())
+	{
+		// A placed instance from an older rig generation: recorded names no
+		// longer resolve, so part of the rig is DEAD (bodies fall out,
+		// joints gain DOF, commands hit wrong constraints). Every past
+		// "very wrong behavior" report traced back to this.
+		UE_LOG(LogTemp, Error,
+			TEXT("[%s] STALE ROBOT INSTANCE: only %d of %d rig constraints "
+				 "resolved. Delete this actor and re-place it from the "
+				 "regenerated blueprint."),
+			*Owner->GetActorNameOrLabel(), NumInited, ChaosConstraintComponents.Num());
+#if WITH_EDITOR
+		FMessageLog("PIE").Error(FText::FromString(FString::Printf(
+			TEXT("%s: stale robot instance (%d/%d rig constraints) — delete "
+				 "and re-place it from the updated blueprint."),
+			*Owner->GetActorNameOrLabel(), NumInited, ChaosConstraintComponents.Num())));
+#endif
+	}
+
+	if (CouplerLeaders.Num() > 0)
+	{
+		GetWorld()->GetTimerManager().SetTimer(CouplerTimer,
+			FTimerDelegate::CreateWeakLambda(this, [this]() { TickCouplers(); }),
+			0.016f, true);
+	}
+
+	if (bNeverSleep)
+	{
+		// Chaos puts the settled robot to sleep and sleeping bodies ignore
+		// drive targets (SleepFamily::Custom with multiplier 0 does NOT
+		// prevent it — verified asleep). Brute-force keep-awake tick.
+		GetWorld()->GetTimerManager().SetTimer(KeepAwakeTimer,
+			FTimerDelegate::CreateWeakLambda(this, [this]() { WakeRigBodies(); }),
+			0.5f, true);
+	}
+}
+
+void URammsBackendSwitchComponent::TickCouplers()
+{
+	AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return;
+	}
+	TArray<UPhysicsConstraintComponent*> Constraints;
+	Owner->GetComponents(Constraints);
+	for (int32 i = 0; i < CouplerLeaders.Num() && i < CouplerFollowers.Num(); ++i)
+	{
+		UPhysicsConstraintComponent* Leader = nullptr;
+		UPhysicsConstraintComponent* Follower = nullptr;
+		for (UPhysicsConstraintComponent* C : Constraints)
+		{
+			if (!Leader && NameMatchesRecorded(C->GetFName(), CouplerLeaders[i]))
+			{
+				Leader = C;
+			}
+			if (!Follower && NameMatchesRecorded(C->GetFName(), CouplerFollowers[i]))
+			{
+				Follower = C;
+			}
+		}
+		if (!Leader || !Follower)
+		{
+			continue;
+		}
+		const float Ratio = CouplerRatios.IsValidIndex(i) ? CouplerRatios[i] : 1.f;
+		// Leader value: hinge twist (deg) — or for a SLIDE leader (rod servo),
+		// its extension along X in cm from the spawn pose. Ratio units follow.
+		float LeaderVal = Leader->GetCurrentTwist();
+		if (Leader->ConstraintInstance.GetLinearXMotion() != ELinearConstraintMotion::LCM_Locked)
+		{
+			UPrimitiveComponent* P1 = nullptr;
+			UPrimitiveComponent* P2 = nullptr;
+			FName B1, B2;
+			Leader->GetConstrainedComponents(P1, B1, P2, B2);
+			if (P1 && P2)
+			{
+				const float Ext = FVector::DotProduct(
+					P2->GetComponentLocation() - P1->GetComponentLocation(),
+					Leader->GetForwardVector());
+				if (CouplerLeaderRest.Num() != CouplerLeaders.Num())
+				{
+					CouplerLeaderRest.SetNumZeroed(CouplerLeaders.Num());
+					CouplerLeaderRestSet.SetNumZeroed(CouplerLeaders.Num());
+				}
+				if (!CouplerLeaderRestSet[i])
+				{
+					CouplerLeaderRest[i] = Ext;
+					CouplerLeaderRestSet[i] = 1;
+				}
+				LeaderVal = Ext - CouplerLeaderRest[i];
+			}
+		}
+		const float Target = LeaderVal * Ratio;   // degrees
+		Follower->SetAngularOrientationTarget(FRotator(0.f, 0.f, Target));
+	}
+}
+
+void URammsBackendSwitchComponent::WakeRigBodies()
+{
+	AActor*						 Owner = GetOwner();
+	TArray<UPrimitiveComponent*> Prims;
+	Owner->GetComponents(Prims);
+	for (UPrimitiveComponent* Prim : Prims)
+	{
+		if (Prim->IsSimulatingPhysics()
+			&& NameInRecorded(Prim->GetFName(), ChaosBodyComponents))
+		{
+			Prim->WakeAllRigidBodies();
 		}
 	}
 }
 
 void URammsBackendSwitchComponent::SetJointCommand(FName Joint, float Value)
 {
+	// Chaos LINEAR rods get a slewed target (~3 cm/s): a 6 cm step at
+	// kp=6e5 catapults the mechanism the moment the ground load releases
+	// (rear rod threw the robot 130 m through the floor) — MuJoCo's
+	// implicit integrator absorbs the same step quasistatically. The slew
+	// is safe again at kp=6e5: even a 1 mm lag develops ~600 N (the old
+	// force-starvation happened at kp=6e4 with full-stroke ramps).
+	// Hinge position/velocity drives still apply directly.
+	if (Backend == ERammsPhysicsBackend::Chaos)
+	{
+		for (int32 Idx = 0; Idx < DriveJoints.Num(); ++Idx)
+		{
+			if (DriveJoints[Idx] == Joint
+				&& DriveIsLinear.IsValidIndex(Idx) && DriveIsLinear[Idx])
+			{
+				// Clamp to the published drive range = mechanism-realizable
+				// travel (the caster rods' MJCF ctrlrange overshoots what the
+				// linkage can do; a stalled full-force servo flips the robot).
+				if (DriveCtrlMin.IsValidIndex(Idx) && DriveCtrlMax.IsValidIndex(Idx)
+					&& DriveCtrlMax[Idx] > DriveCtrlMin[Idx])
+				{
+					Value = FMath::Clamp(Value, DriveCtrlMin[Idx], DriveCtrlMax[Idx]);
+				}
+				FVector2D& S = SlewTargets.FindOrAdd(Joint); // X: slewed cur (starts 0 = rest)
+				S.Y = Value;
+				if (!GetWorld()->GetTimerManager().IsTimerActive(SlewTimer))
+				{
+					GetWorld()->GetTimerManager().SetTimer(SlewTimer,
+						FTimerDelegate::CreateWeakLambda(this, [this]() { TickSlew(); }),
+						0.033f, true);
+				}
+				return;
+			}
+		}
+	}
+	ApplyJointTarget(Joint, Value);
+}
+
+void URammsBackendSwitchComponent::TickSlew()
+{
+	bool bAnyMoving = false;
+	for (TPair<FName, FVector2D>& Pair : SlewTargets)
+	{
+		const float Cur = (float)Pair.Value.X;
+		const float Cmd = (float)Pair.Value.Y;
+		if (FMath::IsNearlyEqual(Cur, Cmd, 1e-4f))
+		{
+			continue;
+		}
+		// Rod targets are metres: 0.03 units/s = 3 cm/s, matching the
+		// quasistatic pace MuJoCo's strokes settle at.
+		const float Next = FMath::FInterpConstantTo(Cur, Cmd, 0.033f, 0.03f);
+		Pair.Value.X = Next;
+		ApplyJointTarget(Pair.Key, Next);
+		bAnyMoving = true;
+	}
+	if (!bAnyMoving)
+	{
+		GetWorld()->GetTimerManager().ClearTimer(SlewTimer);
+	}
+}
+
+void URammsBackendSwitchComponent::ApplyJointTarget(FName Joint, float Value)
+{
 	AActor* Owner = GetOwner();
 	if (Backend == ERammsPhysicsBackend::Chaos)
 	{
-		const int32 Idx = DriveJoints.IndexOfByKey(Joint);
-		if (Idx == INDEX_NONE || !DriveConstraints.IsValidIndex(Idx))
-		{
-			return;
-		}
 		TArray<UPhysicsConstraintComponent*> Constraints;
 		Owner->GetComponents(Constraints);
-		for (UPhysicsConstraintComponent* C : Constraints)
+		bool bAny = false;
+		// A drive name may map to SEVERAL constraints (tendon actuators
+		// drive every wrapped joint, e.g. both gripper drivers).
+		for (int32 Idx = 0; Idx < DriveJoints.Num(); ++Idx)
 		{
-			if (!NameMatchesRecorded(C->GetFName(), DriveConstraints[Idx]))
+			if (DriveJoints[Idx] != Joint || !DriveConstraints.IsValidIndex(Idx))
 			{
 				continue;
 			}
-			if (DriveIsLinear.IsValidIndex(Idx) && DriveIsLinear[Idx])
+			const float Scaled = Value
+				* (DriveScale.IsValidIndex(Idx) ? DriveScale[Idx] : 1.f);
+			for (UPhysicsConstraintComponent* C : Constraints)
 			{
-				// metres -> cm along the constraint's X (the slide axis)
-				C->SetLinearPositionTarget(FVector(Value * 100.f, 0.f, 0.f));
+				if (!NameMatchesRecorded(C->GetFName(), DriveConstraints[Idx]))
+				{
+					continue;
+				}
+				if (!bAny)
+				{
+					// Sleeping bodies ignore drive targets — wake the rig.
+					WakeRigBodies();
+					bAny = true;
+				}
+				if (DriveIsLinear.IsValidIndex(Idx) && DriveIsLinear[Idx])
+				{
+					// metres -> cm along the constraint's X (the slide axis)
+					C->SetLinearPositionTarget(FVector(Scaled * 100.f, 0.f, 0.f));
+				}
+				else if (DriveIsPosition.IsValidIndex(Idx) && DriveIsPosition[Idx])
+				{
+					// radians -> orientation target about the twist axis (X)
+					C->SetAngularOrientationTarget(
+						FRotator(0.f, 0.f, FMath::RadiansToDegrees(Scaled)));
+				}
+				else
+				{
+					// rad/s -> rev/s about the twist axis
+					C->SetAngularVelocityTarget(FVector(Scaled / (2.f * PI), 0.f, 0.f));
+				}
+				break;
 			}
-			else if (DriveIsPosition.IsValidIndex(Idx) && DriveIsPosition[Idx])
-			{
-				// radians -> orientation target about the twist axis (X)
-				C->SetAngularOrientationTarget(
-					FRotator(0.f, 0.f, FMath::RadiansToDegrees(Value)));
-			}
-			else
-			{
-				// rad/s -> rev/s about the twist axis
-				C->SetAngularVelocityTarget(FVector(Value / (2.f * PI), 0.f, 0.f));
-			}
-			return;
 		}
 		return;
 	}
@@ -225,11 +562,48 @@ void URammsBackendSwitchComponent::SetJointCommand(FName Joint, float Value)
 		UMjActuator* Act = Cast<UMjActuator>(AC);
 		if (Act && (Act->TargetName == JointStr || Act->GetMjName() == JointStr))
 		{
+			// The articulation resolves effective ctrl from ONE source
+			// (ZMQ -> NetworkValue, UI -> InternalValue). Write both so the
+			// command takes effect regardless of the map's ControlSource.
 			Act->SetControl(Value);
+			Act->SetNetworkControl(Value);
 			return;
 		}
 	}
 }
+
+// Manual joint actuation from the console (any backend):
+//   Ramms.Joint <ActorLabelOrName> <Joint> <Value>
+static FAutoConsoleCommandWithWorldAndArgs GRammsJointCmd(
+	TEXT("Ramms.Joint"),
+	TEXT("Ramms.Joint <ActorLabel> <Joint> <Value> — route a joint command "
+		 "through URammsBackendSwitchComponent::SetJointCommand."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& Args, UWorld* World) {
+			if (Args.Num() < 3 || !World)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("usage: Ramms.Joint <ActorLabel> <Joint> <Value>"));
+				return;
+			}
+			const float Value = FCString::Atof(*Args[2]);
+			for (TActorIterator<AActor> It(World); It; ++It)
+			{
+				AActor* Actor = *It;
+				if (Actor->GetActorNameOrLabel() != Args[0] && Actor->GetName() != Args[0])
+				{
+					continue;
+				}
+				if (URammsBackendSwitchComponent* Sw =
+						Actor->FindComponentByClass<URammsBackendSwitchComponent>())
+				{
+					Sw->SetJointCommand(FName(*Args[1]), Value);
+					UE_LOG(LogTemp, Display, TEXT("Ramms.Joint %s %s = %f"),
+						*Args[0], *Args[1], Value);
+					return;
+				}
+			}
+			UE_LOG(LogTemp, Warning, TEXT("Ramms.Joint: no actor '%s' with a backend switch"), *Args[0]);
+		}));
 
 void URammsBackendSwitchComponent::ApplyMuJoCo()
 {
