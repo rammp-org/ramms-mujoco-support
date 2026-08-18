@@ -349,10 +349,21 @@ namespace
 		// detaches root-level nodes; constraint nodes are children of body
 		// nodes, so use RemoveNodeAndPromoteChildren or repeated runs stack
 		// renamed duplicates (l1/l2...) that keep stale, misplaced configs.
+		// The backend-switch node is REUSED, never recreated: recreating it
+		// orphans per-instance overrides on placed actors (observed: a placed
+		// robot's Backend=Chaos silently reverted to MuJoCo after a
+		// regeneration — every constraint then read as missing). Suffix-
+		// tolerant: historical regens left uniquified names ("...Switch1").
+		auto IsSwitchName = [](const FName& N) {
+			const FString S = N.ToString();
+			const FString Base = TEXT("ChaosRig_BackendSwitch");
+			return S == Base || (S.StartsWith(Base) && S.Mid(Base.Len()).IsNumeric());
+		};
 		TArray<USCS_Node*> Stale;
 		for (USCS_Node* Node : SCS->GetAllNodes())
 		{
-			if (Node->GetVariableName().ToString().StartsWith(TEXT("ChaosRig_")))
+			if (Node->GetVariableName().ToString().StartsWith(TEXT("ChaosRig_"))
+				&& !IsSwitchName(Node->GetVariableName()))
 			{
 				Stale.Add(Node);
 			}
@@ -489,10 +500,44 @@ namespace
 		}
 
 		URammsBackendSwitchComponent* Switch = nullptr;
-		USCS_Node*					  SwitchNode = SCS->CreateNode(URammsBackendSwitchComponent::StaticClass(),
-							   TEXT("ChaosRig_BackendSwitch"));
-		SCS->AddNode(SwitchNode);
+		USCS_Node*					  SwitchNode = nullptr;
+		for (USCS_Node* Node : SCS->GetAllNodes())
+		{
+			if (IsSwitchName(Node->GetVariableName()))
+			{
+				SwitchNode = Node;
+				break;
+			}
+		}
+		if (!SwitchNode)
+		{
+			SwitchNode = SCS->CreateNode(URammsBackendSwitchComponent::StaticClass(),
+				TEXT("ChaosRig_BackendSwitch"));
+			SCS->AddNode(SwitchNode);
+		}
 		Switch = Cast<URammsBackendSwitchComponent>(SwitchNode->ComponentTemplate);
+		// Generator-owned arrays reset; user-facing settings (Backend,
+		// bNeverSleep) survive regeneration.
+		Switch->Modify();
+		Switch->ChaosBodyComponents.Empty();
+		Switch->ChaosConstraintComponents.Empty();
+		Switch->ConstraintLocalFrames.Empty();
+		Switch->ConstraintChildBodies.Empty();
+		Switch->ConstraintBodyFrames.Empty();
+		Switch->ConstraintBodyComponents.Empty();
+		Switch->BodyMasses.Empty();
+		Switch->PieceBodies.Empty();
+		Switch->PieceMeshes.Empty();
+		Switch->DriveJoints.Empty();
+		Switch->DriveConstraints.Empty();
+		Switch->DriveIsPosition.Empty();
+		Switch->DriveIsLinear.Empty();
+		Switch->DriveScale.Empty();
+		Switch->DriveCtrlMin.Empty();
+		Switch->DriveCtrlMax.Empty();
+		Switch->CouplerLeaders.Empty();
+		Switch->CouplerFollowers.Empty();
+		Switch->CouplerRatios.Empty();
 
 		int32										NumBodies = 0, NumConstraints = 0, NumClosures = 0;
 		TSet<UPackage*>								ModifiedMeshPackages;
@@ -686,6 +731,8 @@ namespace
 				CI.SetLinearZLimit(LCM_Locked, 0.f);
 				CI.SetAngularSwing1Limit(ACM_Locked, 0.f);
 				CI.SetAngularSwing2Limit(ACM_Locked, 0.f);
+				// Swing locks default to SOFT (cone stiffness 50 — mush).
+				CI.ProfileInstance.ConeLimit.bSoftConstraint = false;
 				const bool bMebotLinkage = !Pair.Key->GetVariableName().ToString().StartsWith(TEXT("arm_"));
 				if (bLimited && !bMebotLinkage)
 				{
@@ -697,6 +744,15 @@ namespace
 						FMath::Abs(RangeSrc->range[1] - Ref),
 						FMath::Abs(Ref - RangeSrc->range[0]));
 					CI.SetAngularTwistLimit(ACM_Limited, FMath::Max(Half, 1.f));
+					// HARD stop: UE angular limits default to SOFT with
+					// stiffness 50 — mush. Measured: gripper drivers fell to
+					// 85 deg through their 45.8 deg window under gravity once
+					// the (now-fixed) closure pins stopped binding the
+					// mechanism. MuJoCo enforces these ranges stiffly
+					// (solreflimit 0.005); hard windows are the equivalent.
+					// (Mebot linkage windows stay SOFT below — hard windows
+					// against the ground-coupled loops detonate, gotcha 15.)
+					CI.ProfileInstance.TwistLimit.bSoftConstraint = false;
 				}
 				else if (bLimited)
 				{
@@ -710,9 +766,9 @@ namespace
 					// the closures detonated (gotcha 15); soft springs bound the
 					// travel without the solver fight.
 					const float Ref = RefSrc->bOverride_ref ? RefSrc->ref : 0.f;
-					float Half = FMath::Max(
-						FMath::Abs(RangeSrc->range[1] - Ref),
-						FMath::Abs(Ref - RangeSrc->range[0]));
+					float		Half = FMath::Max(
+						  FMath::Abs(RangeSrc->range[1] - Ref),
+						  FMath::Abs(Ref - RangeSrc->range[0]));
 					// (A 15-deg clamp on the suspension arms was tried as a
 					// strut stand-in and DETONATED — window spring vs rod
 					// force is the classic limits-vs-loops energy pump. The
@@ -757,7 +813,7 @@ namespace
 					const bool bArm = Pair.Key->GetVariableName().ToString().StartsWith(TEXT("arm_"));
 					float	   Stiff = FMath::Min(RawStiff * 1e4f * SpringMassScale, 2e6f);
 					float	   Damp = FMath::Min(
-							 (J->damping.Num() ? J->damping[0] : 0.f) * 1e4f * SpringMassScale, 2e5f);
+						 (J->damping.Num() ? J->damping[0] : 0.f) * 1e4f * SpringMassScale, 2e5f);
 					if (bArm && SpringMassScale > 1.f)
 					{
 						// 1.5e4 = 1.5 N*m/rad, paired with the LIGHTER 0.05 kg
@@ -833,9 +889,9 @@ namespace
 					}
 					else
 					{
-					CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
-					CI.SetOrientationDriveTwistAndSwing(true, false);
-					CI.SetAngularDriveParams(Stiff, Damp, 0.f);
+						CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
+						CI.SetOrientationDriveTwistAndSwing(true, false);
+						CI.SetAngularDriveParams(Stiff, Damp, 0.f);
 					}
 					if (Pair.Key->GetVariableName().ToString().StartsWith(TEXT("arm_")))
 					{
@@ -1114,6 +1170,12 @@ namespace
 				const FTransform VizChain = ChainToAncestor(Body.VizNode, Pair.Key);
 				Switch->ConstraintLocalFrames.Add(Local * VizChain.Inverse());
 				Switch->ConstraintChildBodies.Add(Body.VizNode->GetVariableName());
+				// PREFERRED runtime source (see the switch component): the raw
+				// body-local frame + the MjBody component itself. No template
+				// chain baked in — the runtime reads the MjBody instance
+				// transform, which is authoritative at spawn.
+				Switch->ConstraintBodyFrames.Add(Local);
+				Switch->ConstraintBodyComponents.Add(Pair.Key->GetVariableName());
 			}
 			if (J)
 			{
@@ -1130,93 +1192,97 @@ namespace
 		}
 
 		// VIRTUAL COUPLERS: Chaos's iterative solver leaks force through
-	// multi-pin closure loops. The front caster 4-bar (rod -> linkage crank
-	// -> linkage_arm/aux pins -> aux_arm pin -> swing arm) transmits ~40%
-	// less per pin; the rod articulated the crank 18 deg while the swing
-	// arm sat at 0 and the 6 kN reaction flipped the robot. MuJoCo shows a
-	// clean linear relation over the working range: swing_arm = 0.667 x
-	// linkage (front). Enforce it directly: the follower gets a strong
-	// orientation drive whose target the runtime slaves to the leader's
-	// twist every tick — same idea as the rear virtual strut, one solve
-	// between two bodies instead of a leaky chain.
-	{
-		struct FCoupler { const TCHAR* Leader; const TCHAR* Follower; float Ratio; };
-		const FCoupler Couplers[] = {
-			// MuJoCo joint-space ratio is +0.667, but the two Chaos constraint
-			// twist frames are opposite-handed (measured: linkage -9 deg drove
-			// the swing arm +5 with +ratio) -> negate.
-			{ TEXT("front_caster_linkage"), TEXT("front_caster_swing_arm"), -0.667f },
-			// Elevator (rigid-strut model): the rod drives the trunnion
-			// (motor_elevator) and the carriage swing arm follows it —
-			// MuJoCo fit swing = -1.26 x trunnion over the lift range (the
-			// pivot stays frozen with a rigid strut). Chaos measured: rod
-			// 1.9 kN, trunnion 0.6 deg, force stopped at the rod-link pin.
-			// Same handedness convention as the front pair (negate).
-			// Leader = the ROD SLIDE itself (leader value = extension in cm
-			// from spawn), follower = carriage swing arm. MuJoCo fit:
-			// swing = -6.45 rad/m of rod = -3.70 deg/cm. Driving from the
-			// rod skips BOTH leaky pins (rod->rod_link->trunnion): the
-			// trunnion-leader version reached only 3 deg for -0.03 (MuJoCo
-			// -7.5) because the trunnion itself never received the force.
-			// Handedness as measured (negate MuJoCo sign).
-			// ELEVATOR: leader = rod SLIDE (extension cm), follower = TRUNNION
-			// (motor_elevator, NOT the wheel carrier — couplers on the wheel
-			// carrier drove the robot off). MuJoCo: trunnion = 4.47 rad/m of
-			// rod = 2.56 deg/cm. Chaos measured without it: rod 1.8 kN, trunnion
-			// 0.1 deg, force took the easy path — pushed the free-rolling
-			// carriage sideways (robot rolled 90 cm) instead of lifting.
-			// Enforcing the kinematic path forces the lift. Sign per the
-			// front-pair convention (negate MuJoCo).
-			{ TEXT("motor_elevator_rod_l"), TEXT("motor_elevator_l"), -2.56f },
-			{ TEXT("motor_elevator_rod_r"), TEXT("motor_elevator_r"), -2.56f },
-			// Rear: NO coupler with rigid struts (the strut path no longer
-			// leaks; the end-coupler slammed the near-saturated swing arm into
-			// its stop at 24 kN before). Range clamp +-4 cm handles the rest.
-		};
-		// Recorded joint keys carry importer suffixes ("front_caster_linkage1")
-		auto FindJointKey = [&CNameByJoint](const FString& Base) -> FString
+		// multi-pin closure loops. The front caster 4-bar (rod -> linkage crank
+		// -> linkage_arm/aux pins -> aux_arm pin -> swing arm) transmits ~40%
+		// less per pin; the rod articulated the crank 18 deg while the swing
+		// arm sat at 0 and the 6 kN reaction flipped the robot. MuJoCo shows a
+		// clean linear relation over the working range: swing_arm = 0.667 x
+		// linkage (front). Enforce it directly: the follower gets a strong
+		// orientation drive whose target the runtime slaves to the leader's
+		// twist every tick — same idea as the rear virtual strut, one solve
+		// between two bodies instead of a leaky chain.
 		{
-			if (CNameByJoint.Contains(Base))
+			struct FCoupler
 			{
-				return Base;
-			}
-			for (const TPair<FString, FName>& KV : CNameByJoint)
-			{
-				if (KV.Key.StartsWith(Base) && KV.Key.Mid(Base.Len()).IsNumeric())
+				const TCHAR* Leader;
+				const TCHAR* Follower;
+				float		 Ratio;
+			};
+			const FCoupler Couplers[] = {
+				// MuJoCo joint-space ratio is +0.667, but the two Chaos constraint
+				// twist frames are opposite-handed (measured: linkage -9 deg drove
+				// the swing arm +5 with +ratio) -> negate.
+				{ TEXT("front_caster_linkage"), TEXT("front_caster_swing_arm"), -0.667f },
+				// Elevator (rigid-strut model): the rod drives the trunnion
+				// (motor_elevator) and the carriage swing arm follows it —
+				// MuJoCo fit swing = -1.26 x trunnion over the lift range (the
+				// pivot stays frozen with a rigid strut). Chaos measured: rod
+				// 1.9 kN, trunnion 0.6 deg, force stopped at the rod-link pin.
+				// Same handedness convention as the front pair (negate).
+				// Leader = the ROD SLIDE itself (leader value = extension in cm
+				// from spawn), follower = carriage swing arm. MuJoCo fit:
+				// swing = -6.45 rad/m of rod = -3.70 deg/cm. Driving from the
+				// rod skips BOTH leaky pins (rod->rod_link->trunnion): the
+				// trunnion-leader version reached only 3 deg for -0.03 (MuJoCo
+				// -7.5) because the trunnion itself never received the force.
+				// Handedness as measured (negate MuJoCo sign).
+				// ELEVATOR: leader = rod SLIDE (extension cm), follower = TRUNNION
+				// (motor_elevator, NOT the wheel carrier — couplers on the wheel
+				// carrier drove the robot off). MuJoCo: trunnion = 4.47 rad/m of
+				// rod = 2.56 deg/cm. Chaos measured without it: rod 1.8 kN, trunnion
+				// 0.1 deg, force took the easy path — pushed the free-rolling
+				// carriage sideways (robot rolled 90 cm) instead of lifting.
+				// Enforcing the kinematic path forces the lift. Sign per the
+				// front-pair convention (negate MuJoCo).
+				{ TEXT("motor_elevator_rod_l"), TEXT("motor_elevator_l"), -2.56f },
+				{ TEXT("motor_elevator_rod_r"), TEXT("motor_elevator_r"), -2.56f },
+				// Rear: NO coupler with rigid struts (the strut path no longer
+				// leaks; the end-coupler slammed the near-saturated swing arm into
+				// its stop at 24 kN before). Range clamp +-4 cm handles the rest.
+			};
+			// Recorded joint keys carry importer suffixes ("front_caster_linkage1")
+			auto FindJointKey = [&CNameByJoint](const FString& Base) -> FString {
+				if (CNameByJoint.Contains(Base))
 				{
-					return KV.Key;
+					return Base;
 				}
-			}
-			return FString();
-		};
-		for (const FCoupler& Cp : Couplers)
-		{
-			const FString LKey = FindJointKey(Cp.Leader);
-			const FString FKey = FindJointKey(Cp.Follower);
-			const FName* LName = LKey.IsEmpty() ? nullptr : CNameByJoint.Find(LKey);
-			const FName* FName_ = FKey.IsEmpty() ? nullptr : CNameByJoint.Find(FKey);
-			UPhysicsConstraintComponent* const* FCon = FKey.IsEmpty() ? nullptr : ConstraintByJoint.Find(FKey);
-			if (!LName || !FName_ || !FCon)
+				for (const TPair<FString, FName>& KV : CNameByJoint)
+				{
+					if (KV.Key.StartsWith(Base) && KV.Key.Mid(Base.Len()).IsNumeric())
+					{
+						return KV.Key;
+					}
+				}
+				return FString();
+			};
+			for (const FCoupler& Cp : Couplers)
 			{
-				UE_LOG(LogRammsRig, Warning, TEXT("coupler %s->%s: joints not found"),
-					Cp.Leader, Cp.Follower);
-				continue;
+				const FString						LKey = FindJointKey(Cp.Leader);
+				const FString						FKey = FindJointKey(Cp.Follower);
+				const FName*						LName = LKey.IsEmpty() ? nullptr : CNameByJoint.Find(LKey);
+				const FName*						FName_ = FKey.IsEmpty() ? nullptr : CNameByJoint.Find(FKey);
+				UPhysicsConstraintComponent* const* FCon = FKey.IsEmpty() ? nullptr : ConstraintByJoint.Find(FKey);
+				if (!LName || !FName_ || !FCon)
+				{
+					UE_LOG(LogRammsRig, Warning, TEXT("coupler %s->%s: joints not found"),
+						Cp.Leader, Cp.Follower);
+					continue;
+				}
+				FConstraintInstance& FCI = (*FCon)->ConstraintInstance;
+				FCI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
+				FCI.SetOrientationDriveTwistAndSwing(true, false);
+				// 2e6 = 200 N*m/rad, 2e5 damping: firm enough to carry the swing
+				// arm + wheels, target updated at 60 Hz by the runtime.
+				FCI.SetAngularDriveParams(2e6f, 2e5f, 0.f);
+				Switch->CouplerLeaders.Add(*LName);
+				Switch->CouplerFollowers.Add(*FName_);
+				Switch->CouplerRatios.Add(Cp.Ratio);
+				UE_LOG(LogRammsRig, Display, TEXT("virtual coupler %s -> %s x%.3f"),
+					Cp.Leader, Cp.Follower, Cp.Ratio);
 			}
-			FConstraintInstance& FCI = (*FCon)->ConstraintInstance;
-			FCI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
-			FCI.SetOrientationDriveTwistAndSwing(true, false);
-			// 2e6 = 200 N*m/rad, 2e5 damping: firm enough to carry the swing
-			// arm + wheels, target updated at 60 Hz by the runtime.
-			FCI.SetAngularDriveParams(2e6f, 2e5f, 0.f);
-			Switch->CouplerLeaders.Add(*LName);
-			Switch->CouplerFollowers.Add(*FName_);
-			Switch->CouplerRatios.Add(Cp.Ratio);
-			UE_LOG(LogRammsRig, Display, TEXT("virtual coupler %s -> %s x%.3f"),
-				Cp.Leader, Cp.Follower, Cp.Ratio);
 		}
-	}
 
-	// Tendon actuators (the 2f85 fingers) target a TENDON, not a joint, so
+		// Tendon actuators (the 2f85 fingers) target a TENDON, not a joint, so
 		// the per-joint matching above skips them and the fingers flop. Map the
 		// actuator onto every Joint-type wrap of its tendon: orientation-hold
 		// drives on the wrapped joints, all registered under ONE drive name so
@@ -1430,15 +1496,17 @@ namespace
 			// that killed the first x100 attempt). Soft linear limits emulate
 			// solref compliance and let the residual geometric error live in
 			// the spring instead of the solver fight.
-			// Projection ONLY on the gripper's free-floating pins — measured on
-			// the mebot loops: without projection a loaded rear stroke tips the
-			// robot gently (v=18); with it the same stroke teleport-pumps the
-			// ground-coupled loops and throws the robot through the floor at
-			// v=4600. The gripper four-bars never touch ground, and WITHOUT
-			// position-level help their gram-scale links leak through the pins
-			// (followers sagged to +50 deg, couplers -15, springs -20 at rest
-			// while MuJoCo holds ~0).
-			CI.ProfileInstance.bEnableProjection = Eq->Obj1.StartsWith(TEXT("arm_"));
+			// NO projection on ANY pin (2026-08-18). The gripper-pin projection
+			// dated from the broken-frame era: the real bug was
+			// UpdateConstraintFrames dividing frame positions by the constraint
+			// component's inherited scale (the gripper chain carries imported-
+			// asset compensating scales), which parked the coupler-side frame
+			// at the coupler ORIGIN — the pin never closed, and projection was
+			// papering over it. With runtime scale-1 normalization the pins
+			// initialize exact (sep 0.000), and measured WITH projection the
+			// solver leaves the locked pin torn 4.79 cm at rest while WITHOUT
+			// it the pin holds 0.00-0.03 cm through free-flop and drive load.
+			CI.ProfileInstance.bEnableProjection = false;
 			// Pin linear constraint, two regimes:
 			// - arm_ (gripper) pins: HARD lock + projection. Free-floating
 			//   four-bars, verified placement, works.
@@ -1490,6 +1558,9 @@ namespace
 				FTransform(FRotationMatrix::MakeFromX(PinAxis).ToQuat(), AnchorCm)
 				* ChainToAncestor(R1->VizNode, B1).Inverse());
 			Switch->ConstraintChildBodies.Add(R1->VizNode->GetVariableName());
+			Switch->ConstraintBodyFrames.Add(
+				FTransform(FRotationMatrix::MakeFromX(PinAxis).ToQuat(), AnchorCm));
+			Switch->ConstraintBodyComponents.Add(B1->GetVariableName());
 			++NumClosures;
 
 			// VIRTUAL STRUT (rear caster): the physical strut is a 3-body
@@ -1511,24 +1582,24 @@ namespace
 			// dead code for reference; never taken.
 			if (false && Eq->Obj1 == TEXT("rear_caster_dampener_rod"))
 			{
-				const FRigBody* RodRig = R1;                     // dampener_rod
-				USCS_Node* DampNode = RodRig->ParentBody;        // dampener
+				const FRigBody* RodRig = R1;				   // dampener_rod
+				USCS_Node*		DampNode = RodRig->ParentBody; // dampener
 				const FRigBody* DampRig = DampNode ? Bodies.Find(DampNode) : nullptr;
-				USCS_Node* BaseNode = DampRig ? DampRig->ParentBody : nullptr; // pivot
+				USCS_Node*		BaseNode = DampRig ? DampRig->ParentBody : nullptr; // pivot
 				const FRigBody* BaseRig = BaseNode ? Bodies.Find(BaseNode) : nullptr;
 				if (BaseRig && BaseRig->VizNode)
 				{
 					const FString SName = TEXT("ChaosRig_strut_rear_caster");
-					USCS_Node* SNode = SCS->CreateNode(
-						UPhysicsConstraintComponent::StaticClass(), *SName);
+					USCS_Node*	  SNode = SCS->CreateNode(
+						   UPhysicsConstraintComponent::StaticClass(), *SName);
 					B1->AddChildNode(SNode);
 					UPhysicsConstraintComponent* SC2 =
 						Cast<UPhysicsConstraintComponent>(SNode->ComponentTemplate);
 					// Actor-space strut line: base (pivot origin) -> anchor.
 					const FTransform B1Actor = ChainToAncestor(B1, nullptr);
 					const FTransform BaseActor = ChainToAncestor(BaseNode, nullptr);
-					const FVector AnchorActor = B1Actor.TransformPosition(AnchorCm);
-					const FVector Axis =
+					const FVector	 AnchorActor = B1Actor.TransformPosition(AnchorCm);
+					const FVector	 Axis =
 						(AnchorActor - BaseActor.GetLocation()).GetSafeNormal(1e-4f, FVector::ZAxisVector);
 					const FQuat RelRot = B1Actor.GetRotation().Inverse()
 						* FRotationMatrix::MakeFromX(Axis).ToQuat();
@@ -1553,6 +1624,8 @@ namespace
 						FTransform(RelRot, AnchorCm)
 						* ChainToAncestor(R1->VizNode, B1).Inverse());
 					Switch->ConstraintChildBodies.Add(R1->VizNode->GetVariableName());
+					Switch->ConstraintBodyFrames.Add(FTransform(RelRot, AnchorCm));
+					Switch->ConstraintBodyComponents.Add(B1->GetVariableName());
 					UE_LOG(LogRammsRig, Display,
 						TEXT("virtual strut %s: base=%s arm=%s axis=%s"),
 						*SName, *BaseRig->VizNode->GetVariableName().ToString(),

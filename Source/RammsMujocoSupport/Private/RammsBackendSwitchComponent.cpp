@@ -12,6 +12,20 @@
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
 #include "TimerManager.h"
 
+namespace RammsChaosDbg
+{
+	static bool					   bDisableGripperDrives = false;
+	static FAutoConsoleVariableRef CVarDisableGripperDrives(
+		TEXT("Ramms.Debug.DisableGripperDrives"), bDisableGripperDrives,
+		TEXT("Bisect aid: strip all gripper hinge drives at ApplyChaos."));
+
+	static float				   ArmInertiaScale = 1.f;
+	static FAutoConsoleVariableRef CVarArmInertiaScale(
+		TEXT("Ramms.Debug.ArmInertiaScale"), ArmInertiaScale,
+		TEXT("Inertia tensor scale applied to arm_ rig bodies at ApplyChaos "
+			 "(angular-conditioning experiment; 1 = off)."));
+} // namespace RammsChaosDbg
+
 URammsBackendSwitchComponent::URammsBackendSwitchComponent()
 {
 	PrimaryComponentTick.bCanEverTick = false;
@@ -217,6 +231,16 @@ void URammsBackendSwitchComponent::ApplyChaos()
 				{
 					BI->PositionSolverIterationCount = 32;
 					BI->VelocitySolverIterationCount = 4;
+					// Angular-conditioning experiment: gripper links' cm^2
+					// inertias vs the 8 kg arm make a ~1e4:1 angular ratio —
+					// candidate cause of angular limits/drives being inert on
+					// arm_ bodies while linear locks enforce fine.
+					if (RammsChaosDbg::ArmInertiaScale != 1.f
+						&& Name.ToString().StartsWith(TEXT("arm_")))
+					{
+						BI->InertiaTensorScale = FVector(RammsChaosDbg::ArmInertiaScale);
+						BI->UpdateMassProperties();
+					}
 				}
 			}
 		}
@@ -265,6 +289,8 @@ void URammsBackendSwitchComponent::ApplyChaos()
 	Owner->GetComponents(Constraints);
 	TArray<UStaticMeshComponent*> BodyComps;
 	Owner->GetComponents(BodyComps);
+	TArray<USceneComponent*> SceneComps;
+	Owner->GetComponents(SceneComps);
 	int32 NumInited = 0;
 	for (UPhysicsConstraintComponent* C : Constraints)
 	{
@@ -287,7 +313,55 @@ void URammsBackendSwitchComponent::ApplyChaos()
 		// after a backend switch, and frames initialized from those poses
 		// produce garbage joints. Re-derive the world frame from the
 		// recorded child-body-local transform before initializing.
-		if (ConstraintLocalFrames.IsValidIndex(RecIdx)
+		//
+		// PREFERRED source: the owning MjBody component's live transform +
+		// the recorded body-local frame. The viz-chain frames below bake the
+		// SCS template chain, which drifts from the runtime attachment on
+		// the offset arm/gripper meshes — the residual mm-scale pin error
+		// that made the finger four-bar leak (sag at rest, over-curl on
+		// close). MjBody names are unique per MJCF body, so no shared-asset
+		// ambiguity either.
+		bool bFrameSet = false;
+		if (ConstraintBodyFrames.IsValidIndex(RecIdx)
+			&& ConstraintBodyComponents.IsValidIndex(RecIdx))
+		{
+			USceneComponent* BodyC = nullptr;
+			for (USceneComponent* S : SceneComps)
+			{
+				if (S->GetFName() == ConstraintBodyComponents[RecIdx])
+				{
+					BodyC = S;
+					break;
+				}
+			}
+			for (USceneComponent* S : SceneComps)
+			{
+				if (BodyC)
+				{
+					break;
+				}
+				if (NameMatchesRecorded(S->GetFName(), ConstraintBodyComponents[RecIdx]))
+				{
+					BodyC = S;
+				}
+			}
+			if (BodyC)
+			{
+				// SCALE MUST BE 1: UpdateConstraintFrames divides the computed
+				// body-local frame positions by the constraint component's
+				// scale (RefScale, "used for limits"). The gripper chain
+				// carries the imported-asset compensating scales, so a scale
+				// inherited here shrank the coupler-side pin frame ~1000x —
+				// the pin initialized at the coupler ORIGIN and the finger
+				// four-bar was never closed (the long-standing "pin leak").
+				FTransform Wt =
+					ConstraintBodyFrames[RecIdx] * BodyC->GetComponentTransform();
+				Wt.SetScale3D(FVector::OneVector);
+				C->SetWorldTransform(Wt);
+				bFrameSet = true;
+			}
+		}
+		if (!bFrameSet && ConstraintLocalFrames.IsValidIndex(RecIdx)
 			&& ConstraintChildBodies.IsValidIndex(RecIdx))
 		{
 			// EXACT name first: the gripper's shared-asset viz components
@@ -318,10 +392,42 @@ void URammsBackendSwitchComponent::ApplyChaos()
 			}
 			if (Child)
 			{
-				C->SetWorldTransform(
-					ConstraintLocalFrames[RecIdx] * Child->GetComponentTransform());
+				// Same scale-1 rule as the body-frame path above.
+				FTransform Wt =
+					ConstraintLocalFrames[RecIdx] * Child->GetComponentTransform();
+				Wt.SetScale3D(FVector::OneVector);
+				C->SetWorldTransform(Wt);
 			}
 		}
+		// InitComponentConstraint reuses the SAVED body-local frames — it does
+		// NOT recompute them from the component transform we just corrected,
+		// and UpdateConstraintFrames is a no-op while the joint is live.
+		// Terminate first, recompute the frames from the corrected world pose
+		// against the bodies' spawn poses, then init. Without this the
+		// gripper closure pins kept TEMPLATE-time frames on the coupler side
+		// (4.8 cm off at spawn): the pin initialized permanently torn and the
+		// finger four-bar sagged to its window edges.
+		// Projection must stay OFF on closure pins even if a stale rig
+		// recorded it on (generator emitted it for gripper pins before
+		// 2026-08-18): with projection the solver leaves the locked pin torn
+		// ~4.8 cm at rest; without it the same pin holds at 0.00-0.03 cm.
+		if (C->GetName().StartsWith(TEXT("ChaosRig_pin_")))
+		{
+			C->ConstraintInstance.ProfileInstance.bEnableProjection = false;
+		}
+		// Bisect aid (Ramms.Debug.DisableGripperDrives): strip the gripper
+		// hinge drives to separate constraint-geometry torque from drive
+		// dynamics (used to isolate the four-bar rest-pose walk).
+		if (RammsChaosDbg::bDisableGripperDrives
+			&& C->GetName().StartsWith(TEXT("ChaosRig_arm_2f85_")))
+		{
+			FConstraintInstance& XCI = C->ConstraintInstance;
+			XCI.SetOrientationDriveTwistAndSwing(false, false);
+			XCI.SetAngularVelocityDriveTwistAndSwing(false, false);
+			XCI.SetAngularDriveParams(0.f, 0.f, 0.f);
+		}
+		C->TermComponentConstraint();
+		C->UpdateConstraintFrames();
 		C->InitComponentConstraint();
 		++NumInited;
 	}
@@ -398,7 +504,7 @@ void URammsBackendSwitchComponent::TickCouplers()
 		{
 			UPrimitiveComponent* P1 = nullptr;
 			UPrimitiveComponent* P2 = nullptr;
-			FName B1, B2;
+			FName				 B1, B2;
 			Leader->GetConstrainedComponents(P1, B1, P2, B2);
 			if (P1 && P2)
 			{
@@ -418,7 +524,7 @@ void URammsBackendSwitchComponent::TickCouplers()
 				LeaderVal = Ext - CouplerLeaderRest[i];
 			}
 		}
-		const float Target = LeaderVal * Ratio;   // degrees
+		const float Target = LeaderVal * Ratio; // degrees
 		Follower->SetAngularOrientationTarget(FRotator(0.f, 0.f, Target));
 	}
 }

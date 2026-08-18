@@ -60,6 +60,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ramms|Backend")
 	TArray<FName> ConstraintChildBodies;
 
+	/** Parallel to ChaosConstraintComponents: the constraint's authoritative
+	 *  frame LOCAL TO its owning MjBody component. Preferred over
+	 *  ConstraintLocalFrames when present: the recorded viz-chain frames bake
+	 *  the SCS TEMPLATE chain, which drifts from the runtime attachment for
+	 *  the offset arm/gripper viz meshes (residual pin error = the finger
+	 *  four-bar sag/over-curl), and viz names are shared-asset ambiguous.
+	 *  MjBody names are unique per MJCF body and the instances sit at the
+	 *  authoritative spawn pose when ApplyChaos re-derives frames. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ramms|Backend")
+	TArray<FTransform> ConstraintBodyFrames;
+
+	/** Parallel to ChaosConstraintComponents: the MjBody scene component the
+	 *  body-local frame is relative to. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ramms|Backend")
+	TArray<FName> ConstraintBodyComponents;
+
 	/** Parallel to ChaosBodyComponents: MJCF inertial mass in kg (0 = unknown,
 	 *  runtime falls back to a small default). URLab viz meshes carry no usable
 	 *  auto-mass, and near-massless bodies get pushed through the floor. */
@@ -105,7 +121,7 @@ public:
 	TArray<uint8> CouplerLeaderRestSet;
 
 	FTimerHandle CouplerTimer;
-	void TickCouplers();
+	void		 TickCouplers();
 
 	/** Keep-awake tick handle (bNeverSleep). */
 	FTimerHandle KeepAwakeTimer;
@@ -114,9 +130,9 @@ public:
 	 *  drives ease toward the commanded target (5 cm/s / 60 deg/s) so a
 	 *  slider step never becomes a force impulse. */
 	TMap<FName, FVector2D> SlewTargets;
-	FTimerHandle SlewTimer;
-	void TickSlew();
-	void ApplyJointTarget(FName Joint, float Value);
+	FTimerHandle		   SlewTimer;
+	void				   TickSlew();
+	void				   ApplyJointTarget(FName Joint, float Value);
 
 	/** Wake every simulated rig body. */
 	void WakeRigBodies();
