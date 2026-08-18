@@ -9,6 +9,7 @@
 // ctrlrange; wheels (velocity motors, ctrlrange [-1,1] or unknown) get a
 // +-6 rad/s span instead.
 
+#include "Components/StaticMeshComponent.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -436,6 +437,8 @@ namespace
 			int32										 LastConsMatched = 0;
 			TMap<FName, FVector2D>						 TwistFirstLast; // deg or cm
 			TArray<TPair<FName, float>>					 BodyMasses;	 // kg, sampled once
+			TMap<FName, FQuat>							 GripInitRel;	 // body1^-1*body2 at t0
+			TMap<FName, float>							 GripDirectDeg;	 // true hinge angle
 		};
 		TSharedRef<FProbeState> St = MakeShared<FProbeState>();
 		St->Robot = Robot;
@@ -557,6 +560,49 @@ namespace
 					else
 					{
 						Value = C->GetCurrentTwist();
+						// Independent angle measurement for the gripper hinges:
+						// GetCurrentTwist trusts the solver's frame bookkeeping.
+						// Recompute the joint angle DIRECTLY from the two bodies'
+						// world rotations — the rotation accumulated since t0,
+						// resolved about the constraint's body1-local hinge axis
+						// (PriAxis1). If this disagrees with GetCurrentTwist the
+						// "limit violation" is a measurement artifact.
+						if (C->GetFName().ToString().Contains(TEXT("arm_2f85")))
+						{
+							UPrimitiveComponent* P1 = nullptr;
+							UPrimitiveComponent* P2 = nullptr;
+							FName				 Bq1, Bq2;
+							C->GetConstrainedComponents(P1, Bq1, P2, Bq2);
+							if (P1 && P2)
+							{
+								auto BodyQuat = [](UPrimitiveComponent* P) {
+									FBodyInstance* BI = P->GetBodyInstance();
+									return BI ? BI->GetUnrealWorldTransform().GetRotation()
+											  : P->GetComponentQuat();
+								};
+								const FQuat Rel = BodyQuat(P1).Inverse() * BodyQuat(P2);
+								if (const FQuat* Init = S->GripInitRel.Find(C->GetFName()))
+								{
+									// Delta = Rel * Init^-1 is the relative rotation
+									// since t0 expressed in body1 space; its signed
+									// angle about axis a is 2*atan2(dot(q.xyz,a), q.w).
+									const FQuat	  Delta = Rel * Init->Inverse();
+									const FVector Axis =
+										C->ConstraintInstance.PriAxis1.GetSafeNormal();
+									const float Signed = FMath::RadiansToDegrees(2.f
+										* FMath::Atan2(
+											FVector::DotProduct(
+												FVector(Delta.X, Delta.Y, Delta.Z), Axis),
+											Delta.W));
+									S->GripDirectDeg.Add(C->GetFName(),
+										FRotator::NormalizeAxis(Signed));
+								}
+								else
+								{
+									S->GripInitRel.Add(C->GetFName(), Rel);
+								}
+							}
+						}
 					}
 					FVector2D& FL = S->TwistFirstLast.FindOrAdd(C->GetFName(),
 						FVector2D(Value, Value));
@@ -619,10 +665,36 @@ namespace
 					{
 						const FVector2D& FL = S->TwistFirstLast[K];
 						const FString	 KS = K.ToString();
-						Report += FString::Printf(TEXT("  %-52s %8.3f -> %8.3f %s\n"), *KS,
+						const float*	 Direct = S->GripDirectDeg.Find(K);
+						FString			 LiveCfg;
+						if (Direct)
+						{
+							// LIVE gripper-constraint config at report time (the
+							// t=0 anatomy dump can race ApplyChaos re-config).
+							TArray<UPhysicsConstraintComponent*> RCons;
+							Robot->GetComponents(RCons);
+							for (UPhysicsConstraintComponent* RC : RCons)
+							{
+								if (RC->GetFName() == K)
+								{
+									const FConstraintInstance& RCI = RC->ConstraintInstance;
+									LiveCfg = FString::Printf(
+										TEXT("  tw=%d(%.0f soft=%d) k=%.0f"),
+										(int32)RCI.GetAngularTwistMotion(),
+										RCI.ProfileInstance.TwistLimit.TwistLimitDegrees,
+										RCI.ProfileInstance.TwistLimit.bSoftConstraint ? 1 : 0,
+										RCI.ProfileInstance.AngularDrive.TwistDrive.Stiffness);
+									break;
+								}
+							}
+						}
+						Report += FString::Printf(TEXT("  %-52s %8.3f -> %8.3f %s%s%s\n"), *KS,
 							FL.X, FL.Y,
 							KS.StartsWith(TEXT("ChaosRig_pin_")) ? TEXT("cm sep")
-																 : TEXT("deg/cm"));
+																 : TEXT("deg/cm"),
+							Direct ? *FString::Printf(TEXT("  direct=%.1f deg"), *Direct)
+								   : TEXT(""),
+							*LiveCfg);
 					}
 					// Mass audit: totals + the heaviest bodies (full per-body
 					// list only in the file dump).
@@ -666,6 +738,158 @@ namespace
 		UE_LOG(LogTemp, Display, TEXT("Ramms.Probe: sampling %s for %.1f s..."),
 			*Robot->GetActorNameOrLabel(), Seconds);
 	}
+
+	// Ramms.ReproHinge — minimal repro for the gripper "angular DOFs inert"
+	// mystery: two plain cubes at gripper-like masses joined by ONE hinge
+	// constraint configured exactly like a 2f85 driver joint (linear locked,
+	// swings locked hard, twist limited hard, TwistAndSwing pos+vel drive,
+	// projection on, runtime Term/Update/Init cycle). The child hangs 10 cm
+	// off-axis so gravity torques it about the twist axis; if the limit
+	// works it stops at LimitDeg, if not it runs to ~90.
+	//   Ramms.ReproHinge [flags] [limitDeg] [k] [d] [childKg] [parentKg]
+	//   flags: 1=posDrive 2=velDrive 4=reinit-cycle 8=parent-simulates(+world
+	//   weld) 16=projection-OFF 32=soft-limit   (default 15 = driver mimic)
+	static void ReproHinge(const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World)
+		{
+			return;
+		}
+		const int32	 Flags = Args.Num() > 0 ? FCString::Atoi(*Args[0]) : 15;
+		const float	 LimitDeg = Args.Num() > 1 ? FCString::Atof(*Args[1]) : 45.8f;
+		const float	 K = Args.Num() > 2 ? FCString::Atof(*Args[2]) : 1e4f;
+		const float	 D = Args.Num() > 3 ? FCString::Atof(*Args[3]) : 5e3f;
+		const float	 ChildKg = Args.Num() > 4 ? FCString::Atof(*Args[4]) : 0.05f;
+		const float	 ParentKg = Args.Num() > 5 ? FCString::Atof(*Args[5]) : 0.78f;
+		UStaticMesh* Cube =
+			LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+		if (!Cube)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Ramms.ReproHinge: no engine cube mesh"));
+			return;
+		}
+		AActor* A = World->SpawnActor<AActor>();
+		if (!A)
+		{
+			return;
+		}
+		USceneComponent* Root = NewObject<USceneComponent>(A, TEXT("ReproRoot"));
+		A->SetRootComponent(Root);
+		Root->RegisterComponent();
+		A->SetActorLocation(FVector(0.f, 0.f, 300.f));
+		auto MakeCube = [&](const TCHAR* Name, const FVector& Pos, float Kg, bool bSim) {
+			UStaticMeshComponent* M = NewObject<UStaticMeshComponent>(A, Name);
+			M->SetupAttachment(Root);
+			M->RegisterComponent();
+			M->SetStaticMesh(Cube);
+			M->SetWorldScale3D(FVector(0.04f)); // 4 cm cube
+			M->SetRelativeLocation(Pos);
+			// No contacts: isolate constraint behavior from collision.
+			M->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+			M->SetCollisionResponseToAllChannels(ECR_Ignore);
+			M->SetSimulatePhysics(bSim);
+			if (bSim)
+			{
+				M->SetMassOverrideInKg(NAME_None, Kg, true);
+			}
+			return M;
+		};
+		const bool			  bParentSim = (Flags & 8) != 0;
+		UStaticMeshComponent* Parent =
+			MakeCube(TEXT("ReproParent"), FVector::ZeroVector, ParentKg, bParentSim);
+		UStaticMeshComponent* Child =
+			MakeCube(TEXT("ReproChild"), FVector(0.f, 10.f, 0.f), ChildKg, true);
+		if (bParentSim)
+		{
+			// Weld the simulating parent to the world so the pair doesn't
+			// free-fall (stand-in for the palm hanging off the held arm).
+			UPhysicsConstraintComponent* Weld =
+				NewObject<UPhysicsConstraintComponent>(A, TEXT("ReproWeld"));
+			Weld->SetupAttachment(Root);
+			Weld->RegisterComponent();
+			FConstraintInstance& WI = Weld->ConstraintInstance;
+			WI.SetLinearXLimit(LCM_Locked, 0.f);
+			WI.SetLinearYLimit(LCM_Locked, 0.f);
+			WI.SetLinearZLimit(LCM_Locked, 0.f);
+			WI.SetAngularSwing1Limit(ACM_Locked, 0.f);
+			WI.SetAngularSwing2Limit(ACM_Locked, 0.f);
+			WI.SetAngularTwistLimit(ACM_Locked, 0.f);
+			Weld->SetConstrainedComponents(nullptr, NAME_None, Parent, NAME_None);
+		}
+		UPhysicsConstraintComponent* C =
+			NewObject<UPhysicsConstraintComponent>(A, TEXT("ReproHinge"));
+		C->SetupAttachment(Root);
+		C->RegisterComponent();
+		C->SetWorldLocation(Parent->GetComponentLocation()); // axis = world +X
+		FConstraintInstance& CI = C->ConstraintInstance;
+		CI.ProfileInstance.bDisableCollision = true;
+		CI.ProfileInstance.bEnableProjection = (Flags & 16) == 0;
+		CI.SetLinearXLimit(LCM_Locked, 0.f);
+		CI.SetLinearYLimit(LCM_Locked, 0.f);
+		CI.SetLinearZLimit(LCM_Locked, 0.f);
+		CI.SetAngularSwing1Limit(ACM_Locked, 0.f);
+		CI.SetAngularSwing2Limit(ACM_Locked, 0.f);
+		CI.ProfileInstance.ConeLimit.bSoftConstraint = false;
+		CI.SetAngularTwistLimit(ACM_Limited, LimitDeg);
+		CI.ProfileInstance.TwistLimit.bSoftConstraint = (Flags & 32) != 0;
+		if (Flags & (1 | 2))
+		{
+			CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
+			CI.SetOrientationDriveTwistAndSwing((Flags & 1) != 0, false);
+			CI.SetAngularVelocityDriveTwistAndSwing((Flags & 2) != 0, false);
+			CI.SetAngularDriveParams(K, D, 0.f);
+		}
+		C->SetConstrainedComponents(Parent, NAME_None, Child, NAME_None);
+		if (Flags & 4)
+		{
+			// The runtime ApplyChaos cycle: constraints get terminated,
+			// re-framed, and re-initialized after bodies flip to simulated.
+			C->TermComponentConstraint();
+			C->UpdateConstraintFrames();
+			C->InitComponentConstraint();
+		}
+		UE_LOG(LogTemp, Display,
+			TEXT("[RammsRepro] spawned: flags=%d limit=%.1f k=%.0f d=%.0f child=%.2fkg parent=%.2fkg"),
+			Flags, LimitDeg, K, D, ChildKg, ParentKg);
+		TSharedRef<FTimerHandle> Handle = MakeShared<FTimerHandle>();
+		TWeakObjectPtr<AActor>	 WA = A;
+		TSharedRef<double>		 End = MakeShared<double>(World->GetTimeSeconds() + 6.0);
+		World->GetTimerManager().SetTimer(*Handle,
+			FTimerDelegate::CreateLambda([WA, Handle, End, World, Flags]() {
+				TSharedRef<FTimerHandle> H = Handle;
+				AActor*					 Act = WA.Get();
+				if (!Act || World->GetTimeSeconds() >= *End)
+				{
+					World->GetTimerManager().ClearTimer(*H);
+					return;
+				}
+				UPhysicsConstraintComponent* C =
+					Act->FindComponentByClass<UPhysicsConstraintComponent>();
+				TArray<UPhysicsConstraintComponent*> Cs;
+				Act->GetComponents(Cs);
+				for (UPhysicsConstraintComponent* X : Cs)
+				{
+					if (X->GetFName() == FName(TEXT("ReproHinge")))
+					{
+						C = X;
+					}
+				}
+				if (C)
+				{
+					UE_LOG(LogTemp, Display,
+						TEXT("[RammsRepro] flags=%d t=%.1f twist=%.1f swing1=%.1f swing2=%.1f"),
+						Flags, World->GetTimeSeconds(), C->GetCurrentTwist(),
+						C->GetCurrentSwing1(), C->GetCurrentSwing2());
+				}
+			}),
+			0.5f, true);
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GRammsReproHingeCmd(
+		TEXT("Ramms.ReproHinge"),
+		TEXT("Ramms.ReproHinge [flags] [limitDeg] [k] [d] [childKg] [parentKg] "
+			 "— minimal 2-cube hinge repro of the gripper driver constraint."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&ReproHinge));
 
 	FAutoConsoleCommandWithWorldAndArgs GRammsProbeCmd(
 		TEXT("Ramms.Probe"),

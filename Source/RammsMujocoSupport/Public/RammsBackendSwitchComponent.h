@@ -76,6 +76,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ramms|Backend")
 	TArray<FName> ConstraintBodyComponents;
 
+	/** Parallel to ChaosConstraintComponents: twist-window CENTER in degrees,
+	 *  UE twist space (0 = symmetric about the spawn pose). MJCF ranges are
+	 *  asymmetric (2f85 driver [0,45.8] — the OPEN stop is AT the spawn
+	 *  pose); the old sign-safe symmetric windows let the finger four-bar
+	 *  fall ~46 deg into the nonphysical open region, where the closure-pin
+	 *  loop crosses its toggle singularity and shoves the hinges to +-83
+	 *  through their hard windows (root-caused 2026-08-18: with the pins
+	 *  disabled every window enforces exactly; with 5-deg windows the loop
+	 *  stays healthy). Runtime rotates the PARENT ref frame about local X by
+	 *  this angle after UpdateConstraintFrames, and shifts drive targets by
+	 *  the same amount. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ramms|Backend")
+	TArray<float> ConstraintTwistCenters;
+
 	/** Parallel to ChaosBodyComponents: MJCF inertial mass in kg (0 = unknown,
 	 *  runtime falls back to a small default). URLab viz meshes carry no usable
 	 *  auto-mass, and near-massless bodies get pushed through the floor. */

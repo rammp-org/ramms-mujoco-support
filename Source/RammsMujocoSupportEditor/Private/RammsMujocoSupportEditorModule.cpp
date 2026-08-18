@@ -525,6 +525,7 @@ namespace
 		Switch->ConstraintChildBodies.Empty();
 		Switch->ConstraintBodyFrames.Empty();
 		Switch->ConstraintBodyComponents.Empty();
+		Switch->ConstraintTwistCenters.Empty();
 		Switch->BodyMasses.Empty();
 		Switch->PieceBodies.Empty();
 		Switch->PieceMeshes.Empty();
@@ -796,6 +797,23 @@ namespace
 			// solver pumps energy into (robot back-flipped at spawn) unless the
 			// error is projected out positionally.
 			CI.ProfileInstance.bEnableProjection = true;
+			// ANGULAR projection (gripper joints only): UE defaults
+			// ProjectionAngularAlpha to 0, so "projection on" only ever
+			// projected LINEAR error — the reason the gripper's linear rows
+			// enforced crisply while its angular windows leaked 10-40 deg
+			// under closure-loop load. Measured 2026-08-18 (rest, loop
+			// closed): alpha 0 -> stops overrun 9-16 deg; alpha 1 -> windows
+			// crisp but the pins tear to 0.15-0.23 cm; alpha 0.25 -> all
+			// windows respected AND pins 0.027-0.036 cm. Gripper only: the
+			// mebot ground loops detonate under hard angular enforcement
+			// (gotcha 15).
+			if (Pair.Key->GetVariableName().ToString().StartsWith(TEXT("arm_2f85_")))
+			{
+				CI.ProfileInstance.ProjectionAngularAlpha = 0.25f;
+			}
+			// UE-twist-space window center recorded for the runtime (deg;
+			// 0 = symmetric window, nothing to offset).
+			float	   TwistCenterDeg = 0.f;
 			const bool bLimited = J && RangeSrc->bOverride_range
 				&& RangeSrc->range.Num() >= 2 && RangeSrc->range[1] > RangeSrc->range[0];
 			if (bWeld)
@@ -817,9 +835,32 @@ namespace
 				// Swing locks default to SOFT (cone stiffness 50 — mush).
 				CI.ProfileInstance.ConeLimit.bSoftConstraint = false;
 				const bool bMebotLinkage = !Pair.Key->GetVariableName().ToString().StartsWith(TEXT("arm_"));
-				if (bLimited && !bMebotLinkage)
+				const bool bGripper = Pair.Key->GetVariableName().ToString().StartsWith(TEXT("arm_2f85_"));
+				if (bLimited && bGripper)
 				{
-					// SIGN-SAFE window (arm/gripper only): symmetric around the
+					// ASYMMETRIC window, honored exactly (2f85 four-bar). The
+					// old sign-safe symmetric window (max half-range both ways)
+					// let the fingers gravity-fall ~46 deg into the nonphysical
+					// OPEN region (MJCF driver range [0,45.8] — the open stop
+					// is AT the spawn pose). Out there the closure-pin loop
+					// crosses its toggle singularity and the pin rows shove the
+					// hinges to +-83 deg THROUGH their hard windows. Measured
+					// (2026-08-18): pins disabled -> every window enforces
+					// exactly (follower 50.2, coupler 90.0); 5-deg windows with
+					// the loop closed -> healthy. Fix: window half = the true
+					// half-range, center offset applied at runtime by rotating
+					// the parent ref frame (UE twist = -MJCF angle, the same
+					// handedness flip DriveScale=-1 encodes).
+					const float LoUE = -RangeSrc->range[1];
+					const float HiUE = -RangeSrc->range[0];
+					TwistCenterDeg = 0.5f * (LoUE + HiUE);
+					const float HalfW = 0.5f * (HiUE - LoUE);
+					CI.SetAngularTwistLimit(ACM_Limited, FMath::Max(HalfW, 1.f));
+					CI.ProfileInstance.TwistLimit.bSoftConstraint = false;
+				}
+				else if (bLimited && !bMebotLinkage)
+				{
+					// SIGN-SAFE window (arm only): symmetric around the
 					// modeled pose, wide enough to cover the full range — a
 					// wrongly-signed asymmetric window kicks at spawn.
 					const float Ref = RefSrc->bOverride_ref ? RefSrc->ref : 0.f;
@@ -828,10 +869,7 @@ namespace
 						FMath::Abs(Ref - RangeSrc->range[0]));
 					CI.SetAngularTwistLimit(ACM_Limited, FMath::Max(Half, 1.f));
 					// HARD stop: UE angular limits default to SOFT with
-					// stiffness 50 — mush. Measured: gripper drivers fell to
-					// 85 deg through their 45.8 deg window under gravity once
-					// the (now-fixed) closure pins stopped binding the
-					// mechanism. MuJoCo enforces these ranges stiffly
+					// stiffness 50 — mush. MuJoCo enforces these ranges stiffly
 					// (solreflimit 0.005); hard windows are the equivalent.
 					// (Mebot linkage windows stay SOFT below — hard windows
 					// against the ground-coupled loops detonate, gotcha 15.)
@@ -1261,6 +1299,7 @@ namespace
 				// transform, which is authoritative at spawn.
 				Switch->ConstraintBodyFrames.Add(Local);
 				Switch->ConstraintBodyComponents.Add(Pair.Key->GetVariableName());
+				Switch->ConstraintTwistCenters.Add(TwistCenterDeg);
 			}
 			if (J)
 			{
@@ -1646,6 +1685,7 @@ namespace
 			Switch->ConstraintBodyFrames.Add(
 				FTransform(FRotationMatrix::MakeFromX(PinAxis).ToQuat(), AnchorCm));
 			Switch->ConstraintBodyComponents.Add(B1->GetVariableName());
+			Switch->ConstraintTwistCenters.Add(0.f);
 			++NumClosures;
 
 			// VIRTUAL STRUT (rear caster): the physical strut is a 3-body
@@ -1711,6 +1751,7 @@ namespace
 					Switch->ConstraintChildBodies.Add(R1->VizNode->GetVariableName());
 					Switch->ConstraintBodyFrames.Add(FTransform(RelRot, AnchorCm));
 					Switch->ConstraintBodyComponents.Add(B1->GetVariableName());
+					Switch->ConstraintTwistCenters.Add(0.f);
 					UE_LOG(LogRammsRig, Display,
 						TEXT("virtual strut %s: base=%s arm=%s axis=%s"),
 						*SName, *BaseRig->VizNode->GetVariableName().ToString(),

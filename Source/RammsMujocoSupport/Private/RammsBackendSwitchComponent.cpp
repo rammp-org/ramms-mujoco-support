@@ -9,6 +9,8 @@
 #include "PhysicsEngine/BodyInstance.h"
 #include "MuJoCo/Components/Actuators/MjActuator.h"
 #include "MuJoCo/Components/MjComponent.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
 #include "TimerManager.h"
 
@@ -30,6 +32,61 @@ namespace RammsChaosDbg
 		TEXT("Ramms.Debug.GripperDriveScale"), GripperDriveScale,
 		TEXT("Multiply gripper (arm_2f85) hinge drive stiffness/damping at "
 			 "ApplyChaos (drive-magnitude experiment; 1 = off)."));
+
+	static float				   GripperLimitDeg = 0.f;
+	static FAutoConsoleVariableRef CVarGripperLimitDeg(
+		TEXT("Ramms.Debug.GripperLimitDeg"), GripperLimitDeg,
+		TEXT("If > 0, override EVERY arm_2f85 hinge twist window to +-N deg "
+			 "HARD at ApplyChaos (limit-row-presence experiment; 0 = off)."));
+
+	static bool					   bDisableGripperPins = false;
+	static FAutoConsoleVariableRef CVarDisableGripperPins(
+		TEXT("Ramms.Debug.DisableGripperPins"), bDisableGripperPins,
+		TEXT("Bisect aid: leave the two gripper follower-coupler closure pins "
+			 "un-initialized at ApplyChaos (loop-vs-angular-rows experiment)."));
+
+	static float				   GripperAngularProjection = 0.f;
+	static FAutoConsoleVariableRef CVarGripperAngularProjection(
+		TEXT("Ramms.Debug.GripperAngularProjection"), GripperAngularProjection,
+		TEXT("If > 0, set ProjectionAngularAlpha on arm_2f85 hinge constraints "
+			 "at ApplyChaos (UE default is 0 — angular error is never "
+			 "projected; 0 = leave as configured)."));
+
+	// GOTCHA (2026-08-18, measured): -ExecCmds are DEFERRED commands — the
+	// engine executes them AFTER the first world tick, i.e. AFTER ApplyChaos
+	// has already re-initialized every constraint in a headless -game run.
+	// Every cvar read below therefore still holds its default during
+	// ApplyChaos when set via -ExecCmds, and the earlier drive/inertia
+	// bisects silently tested nothing. Command-line switches exist from
+	// process start; pull them in here.
+	static void PullCommandLineOverrides()
+	{
+		float V;
+		if (FParse::Value(FCommandLine::Get(), TEXT("RammsArmInertiaScale="), V))
+		{
+			ArmInertiaScale = V;
+		}
+		if (FParse::Value(FCommandLine::Get(), TEXT("RammsGripperDriveScale="), V))
+		{
+			GripperDriveScale = V;
+		}
+		if (FParse::Value(FCommandLine::Get(), TEXT("RammsGripperLimitDeg="), V))
+		{
+			GripperLimitDeg = V;
+		}
+		if (FParse::Value(FCommandLine::Get(), TEXT("RammsGripperAngularProjection="), V))
+		{
+			GripperAngularProjection = V;
+		}
+		if (FParse::Param(FCommandLine::Get(), TEXT("RammsDisableGripperDrives")))
+		{
+			bDisableGripperDrives = true;
+		}
+		if (FParse::Param(FCommandLine::Get(), TEXT("RammsDisableGripperPins")))
+		{
+			bDisableGripperPins = true;
+		}
+	}
 } // namespace RammsChaosDbg
 
 URammsBackendSwitchComponent::URammsBackendSwitchComponent()
@@ -97,6 +154,7 @@ static bool NameInRecorded(const FName& Actual, const TArray<FName>& Recorded)
 
 void URammsBackendSwitchComponent::ApplyChaos()
 {
+	RammsChaosDbg::PullCommandLineOverrides();
 	AActor* Owner = GetOwner();
 	// NOTE on solver iterations: raising the global cvars
 	// (p.Chaos.Solver.Iterations.Position 30-50) was tried against the
@@ -243,8 +301,13 @@ void URammsBackendSwitchComponent::ApplyChaos()
 					// inertias vs the 8 kg arm make a ~1e4:1 angular ratio —
 					// candidate cause of angular limits/drives being inert on
 					// arm_ bodies while linear locks enforce fine.
+					// NOTE recorded body names are VIZ component names
+					// ("Viz_arm_..."), so the original bare "arm_" prefix test
+					// NEVER matched — the earlier x20/x20000 inertia runs were
+					// silent no-ops.
 					if (RammsChaosDbg::ArmInertiaScale != 1.f
-						&& Name.ToString().StartsWith(TEXT("arm_")))
+						&& (Name.ToString().StartsWith(TEXT("arm_"))
+							|| Name.ToString().StartsWith(TEXT("Viz_arm_"))))
 					{
 						BI->InertiaTensorScale = FVector(RammsChaosDbg::ArmInertiaScale);
 						BI->UpdateMassProperties();
@@ -313,6 +376,18 @@ void URammsBackendSwitchComponent::ApplyChaos()
 		}
 		if (RecIdx == INDEX_NONE)
 		{
+			continue;
+		}
+		// Bisect aid (Ramms.Debug.DisableGripperPins): kill ONLY the gripper
+		// closure pins. If the finger hinges' angular rows start enforcing
+		// with the loop open, the closure is what defeats them.
+		if (RammsChaosDbg::bDisableGripperPins
+			&& C->GetName().StartsWith(TEXT("ChaosRig_pin_arm_2f85_")))
+		{
+			C->TermComponentConstraint();
+			UE_LOG(LogTemp, Display, TEXT("[ApplyChaos] pin DISABLED: %s"),
+				*C->GetName());
+			++NumInited; // counted so the stale-instance check stays quiet
 			continue;
 		}
 		// Editor-side construction reruns (flipping Backend in the Details
@@ -450,8 +525,58 @@ void URammsBackendSwitchComponent::ApplyChaos()
 					TD.Damping * RammsChaosDbg::GripperDriveScale, 0.f);
 			}
 		}
+		// Experiment (Ramms.Debug.GripperAngularProjection): UE defaults
+		// ProjectionAngularAlpha to 0 — "projection on" only ever projected
+		// LINEAR error, which is why linear rows enforce crisply while the
+		// angular windows leak double digits under closure-loop load.
+		if (RammsChaosDbg::GripperAngularProjection > 0.f
+			&& C->GetName().StartsWith(TEXT("ChaosRig_arm_2f85_")))
+		{
+			FConstraintInstance& XCI = C->ConstraintInstance;
+			XCI.ProfileInstance.bEnableProjection = true;
+			XCI.ProfileInstance.ProjectionAngularAlpha =
+				FMath::Clamp(RammsChaosDbg::GripperAngularProjection, 0.f, 1.f);
+		}
+		// Bisect aid (Ramms.Debug.GripperLimitDeg): clamp every gripper hinge
+		// twist window to a tiny HARD range. If followers obey it while
+		// drivers still fall past it, the driver's angular limit rows are
+		// provably absent from the live solver (not just mis-tuned).
+		if (RammsChaosDbg::GripperLimitDeg > 0.f
+			&& C->GetName().StartsWith(TEXT("ChaosRig_arm_2f85_")))
+		{
+			FConstraintInstance& XCI = C->ConstraintInstance;
+			XCI.SetAngularTwistLimit(ACM_Limited, RammsChaosDbg::GripperLimitDeg);
+			XCI.ProfileInstance.TwistLimit.bSoftConstraint = false;
+			UE_LOG(LogTemp, Display,
+				TEXT("[ApplyChaos] twist window override %.1f deg on %s"),
+				RammsChaosDbg::GripperLimitDeg, *C->GetName());
+		}
 		C->TermComponentConstraint();
 		C->UpdateConstraintFrames();
+		// ASYMMETRIC twist windows (2f85 four-bar): rotate the PARENT ref
+		// frame about the twist axis by the recorded window center, so the
+		// symmetric +-half window covers the true MJCF range. Measured twist
+		// then reads (physical - center): the 2f85 rest pose sits ON its
+		// open stop, exactly like MuJoCo. Drive targets are shifted by the
+		// same center (here for the rest hold, ApplyJointTarget for
+		// commands).
+		if (ConstraintTwistCenters.IsValidIndex(RecIdx)
+			&& FMath::Abs(ConstraintTwistCenters[RecIdx]) > 0.01f)
+		{
+			FConstraintInstance& XCI = C->ConstraintInstance;
+			const float			 CenterRad =
+				FMath::DegreesToRadians(ConstraintTwistCenters[RecIdx]);
+			FTransform F1 = XCI.GetRefFrame(EConstraintFrame::Frame1);
+			F1.SetRotation(F1.GetRotation() * FQuat(FVector::XAxisVector, CenterRad));
+			XCI.SetRefFrame(EConstraintFrame::Frame1, F1);
+			if (XCI.ProfileInstance.AngularDrive.TwistDrive.bEnablePositionDrive)
+			{
+				// Hold the SPAWN pose (physical 0 = measured -center), not
+				// the window center.
+				XCI.SetAngularOrientationTarget(
+					FQuat(FVector::XAxisVector, -CenterRad));
+			}
+		}
 		C->InitComponentConstraint();
 		++NumInited;
 	}
@@ -668,9 +793,23 @@ void URammsBackendSwitchComponent::ApplyJointTarget(FName Joint, float Value)
 				}
 				else if (DriveIsPosition.IsValidIndex(Idx) && DriveIsPosition[Idx])
 				{
-					// radians -> orientation target about the twist axis (X)
-					C->SetAngularOrientationTarget(
-						FRotator(0.f, 0.f, FMath::RadiansToDegrees(Scaled)));
+					// radians -> orientation target about the twist axis (X).
+					// Asymmetric-window constraints measure twist offset by
+					// the recorded window center; shift the target so command
+					// values stay in spawn-zero (MJCF) coordinates.
+					float CenterDeg = 0.f;
+					for (int32 i = 0; i < ChaosConstraintComponents.Num(); ++i)
+					{
+						if (ChaosConstraintComponents[i] == DriveConstraints[Idx])
+						{
+							CenterDeg = ConstraintTwistCenters.IsValidIndex(i)
+								? ConstraintTwistCenters[i]
+								: 0.f;
+							break;
+						}
+					}
+					C->SetAngularOrientationTarget(FRotator(0.f, 0.f,
+						FMath::RadiansToDegrees(Scaled) - CenterDeg));
 				}
 				else
 				{
