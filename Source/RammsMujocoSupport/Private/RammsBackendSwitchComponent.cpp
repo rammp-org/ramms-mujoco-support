@@ -24,6 +24,12 @@ namespace RammsChaosDbg
 		TEXT("Ramms.Debug.ArmInertiaScale"), ArmInertiaScale,
 		TEXT("Inertia tensor scale applied to arm_ rig bodies at ApplyChaos "
 			 "(angular-conditioning experiment; 1 = off)."));
+
+	static float				   GripperDriveScale = 1.f;
+	static FAutoConsoleVariableRef CVarGripperDriveScale(
+		TEXT("Ramms.Debug.GripperDriveScale"), GripperDriveScale,
+		TEXT("Multiply gripper (arm_2f85) hinge drive stiffness/damping at "
+			 "ApplyChaos (drive-magnitude experiment; 1 = off)."));
 } // namespace RammsChaosDbg
 
 URammsBackendSwitchComponent::URammsBackendSwitchComponent()
@@ -208,7 +214,9 @@ void URammsBackendSwitchComponent::ApplyChaos()
 					// Rolling resistance (MJCF damping 0.3-0.5 + frictionloss
 					// equivalent): without it the wheels coast forever on any
 					// settle impulse and the chair slides around at rest.
-					Prim->SetAngularDamping(0.5f);
+					// 2.0 (was 0.5): the undriven chair still rolled too
+					// freely under a push (user feedback 2026-08-18).
+					Prim->SetAngularDamping(2.f);
 				}
 				if (bLinkagePiece)
 				{
@@ -425,6 +433,22 @@ void URammsBackendSwitchComponent::ApplyChaos()
 			XCI.SetOrientationDriveTwistAndSwing(false, false);
 			XCI.SetAngularVelocityDriveTwistAndSwing(false, false);
 			XCI.SetAngularDriveParams(0.f, 0.f, 0.f);
+		}
+		// Bisect aid (Ramms.Debug.GripperDriveScale): scale the gripper hinge
+		// drive gains — the 1e4 dt-limit was calibrated against the
+		// broken-pin-frame rig; with the loop closed the safe ceiling may be
+		// far higher.
+		if (RammsChaosDbg::GripperDriveScale != 1.f
+			&& C->GetName().StartsWith(TEXT("ChaosRig_arm_2f85_")))
+		{
+			FConstraintInstance&	XCI = C->ConstraintInstance;
+			const FConstraintDrive& TD = XCI.ProfileInstance.AngularDrive.TwistDrive;
+			if (TD.bEnablePositionDrive || TD.bEnableVelocityDrive)
+			{
+				XCI.SetAngularDriveParams(
+					TD.Stiffness * RammsChaosDbg::GripperDriveScale,
+					TD.Damping * RammsChaosDbg::GripperDriveScale, 0.f);
+			}
 		}
 		C->TermComponentConstraint();
 		C->UpdateConstraintFrames();

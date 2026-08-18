@@ -435,6 +435,7 @@ namespace
 			int32										 LastConsSeen = 0;
 			int32										 LastConsMatched = 0;
 			TMap<FName, FVector2D>						 TwistFirstLast; // deg or cm
+			TArray<TPair<FName, float>>					 BodyMasses;	 // kg, sampled once
 		};
 		TSharedRef<FProbeState> St = MakeShared<FProbeState>();
 		St->Robot = Robot;
@@ -475,6 +476,20 @@ namespace
 						S->SpeedAccum += Speed;
 						++S->Samples;
 						break;
+					}
+				}
+				// One-shot mass audit: what does Chaos ACTUALLY simulate per
+				// rig body? (BodyMasses records intent; floors/overrides/
+				// auto-mass can diverge — wrong distribution reads as "the
+				// arm tips the 140 kg base".)
+				if (S->BodyMasses.Num() == 0)
+				{
+					for (UPrimitiveComponent* P : Prims)
+					{
+						if (P->IsSimulatingPhysics())
+						{
+							S->BodyMasses.Emplace(P->GetFName(), P->GetMass());
+						}
 					}
 				}
 				// Per-constraint values (drives by twist/linear, pins by separation
@@ -546,15 +561,43 @@ namespace
 					FVector2D& FL = S->TwistFirstLast.FindOrAdd(C->GetFName(),
 						FVector2D(Value, Value));
 					FL.Y = Value;
-					if (S->Samples <= 1 && C->GetFName().ToString().Contains(TEXT("driver")))
+					if (S->Samples <= 1 && C->GetFName().ToString().Contains(TEXT("arm_2f85"))
+						&& !C->GetFName().ToString().Contains(TEXT("pin")))
 					{
-						const FConstraintDrive& TD =
-							C->ConstraintInstance.ProfileInstance.AngularDrive.TwistDrive;
+						// Full constraint anatomy for the gripper hinges — the
+						// angular DOFs are mysteriously inert on these links
+						// while linear locks enforce; dump everything the
+						// solver was given.
+						const FConstraintInstance& CI = C->ConstraintInstance;
+						const FConstraintDrive&	   TD = CI.ProfileInstance.AngularDrive.TwistDrive;
+						UPrimitiveComponent*	   P1 = nullptr;
+						UPrimitiveComponent*	   P2 = nullptr;
+						FName					   Bn1, Bn2;
+						C->GetConstrainedComponents(P1, Bn1, P2, Bn2);
 						UE_LOG(LogTemp, Display,
-							TEXT("[RammsProbe] drive %s: posDrive=%d velDrive=%d stiff=%.0f damp=%.0f mode=%d"),
-							*C->GetName(), TD.bEnablePositionDrive ? 1 : 0,
-							TD.bEnableVelocityDrive ? 1 : 0, TD.Stiffness, TD.Damping,
-							(int32)C->ConstraintInstance.ProfileInstance.AngularDrive.AngularDriveMode);
+							TEXT("[RammsProbe] gripcon %s: P1=%s(sim=%d scl=%s) P2=%s(sim=%d scl=%s)"),
+							*C->GetName(),
+							P1 ? *P1->GetName() : TEXT("null"),
+							P1 && P1->IsSimulatingPhysics() ? 1 : 0,
+							P1 ? *P1->GetComponentScale().ToString() : TEXT("-"),
+							P2 ? *P2->GetName() : TEXT("null"),
+							P2 && P2->IsSimulatingPhysics() ? 1 : 0,
+							P2 ? *P2->GetComponentScale().ToString() : TEXT("-"));
+						UE_LOG(LogTemp, Display,
+							TEXT("[RammsProbe]   Pos1=%s Pri1=%s | Pos2=%s Pri2=%s | Cscl=%s"),
+							*CI.Pos1.ToString(), *CI.PriAxis1.ToString(),
+							*CI.Pos2.ToString(), *CI.PriAxis2.ToString(),
+							*C->GetComponentScale().ToString());
+						UE_LOG(LogTemp, Display,
+							TEXT("[RammsProbe]   twist=%.1f swing1=%.1f swing2=%.1f | drive pos=%d vel=%d k=%.0f d=%.0f mode=%d | limits tw=%d(%d,%.0f) sw1=%d sw2=%d"),
+							C->GetCurrentTwist(), C->GetCurrentSwing1(), C->GetCurrentSwing2(),
+							TD.bEnablePositionDrive ? 1 : 0, TD.bEnableVelocityDrive ? 1 : 0,
+							TD.Stiffness, TD.Damping,
+							(int32)CI.ProfileInstance.AngularDrive.AngularDriveMode,
+							(int32)CI.GetAngularTwistMotion(),
+							CI.ProfileInstance.TwistLimit.bSoftConstraint ? 1 : 0,
+							CI.ProfileInstance.TwistLimit.TwistLimitDegrees,
+							(int32)CI.GetAngularSwing1Motion(), (int32)CI.GetAngularSwing2Motion());
 					}
 				}
 				if (W->GetTimeSeconds() >= S->EndTime)
@@ -580,6 +623,32 @@ namespace
 							FL.X, FL.Y,
 							KS.StartsWith(TEXT("ChaosRig_pin_")) ? TEXT("cm sep")
 																 : TEXT("deg/cm"));
+					}
+					// Mass audit: totals + the heaviest bodies (full per-body
+					// list only in the file dump).
+					{
+						float TotalKg = 0.f, ArmKg = 0.f;
+						for (const TPair<FName, float>& M : S->BodyMasses)
+						{
+							TotalKg += M.Value;
+							if (M.Key.ToString().StartsWith(TEXT("Viz_arm_"))
+								|| M.Key.ToString().Contains(TEXT("__arm_")))
+							{
+								ArmKg += M.Value;
+							}
+						}
+						Report += FString::Printf(
+							TEXT("  masses: total=%.1f kg, arm-ish=%.1f kg, base=%.1f kg, %d bodies\n"),
+							TotalKg, ArmKg, TotalKg - ArmKg, S->BodyMasses.Num());
+						TArray<TPair<FName, float>> Sorted = S->BodyMasses;
+						Sorted.Sort([](const TPair<FName, float>& A, const TPair<FName, float>& B) {
+							return A.Value > B.Value;
+						});
+						for (const TPair<FName, float>& M : Sorted)
+						{
+							Report += FString::Printf(TEXT("  mass %-58s %9.3f kg\n"),
+								*M.Key.ToString(), M.Value);
+						}
 					}
 					// Log line-by-line (multi-line entries can be truncated by some
 					// sinks) and dump the full report to Saved/ for headless runs.

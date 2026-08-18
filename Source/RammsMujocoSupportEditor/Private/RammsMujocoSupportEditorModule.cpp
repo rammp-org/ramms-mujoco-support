@@ -558,6 +558,89 @@ namespace
 			}
 		}
 
+		// PHYSICS BODIES MUST BE UNIT-SCALE (2026-08-18). The arm/gripper
+		// meshes import at 1000x geometry with a 0.001 compensating component
+		// scale; a scaled physics body runs its ANGULAR constraint math in
+		// mesh space, where configured torques are (1/scale)^2 = 1e6x too
+		// weak. Measured: finger drives (k=1e4) and HARD 45.8 deg twist
+		// windows had zero effect (fingers gravity-fell to 85 deg) while the
+		// SAME constraints' linear rows enforced exactly — and the arm's
+		// 5e7-scale servos barely held (effective ~50). Fix: bake the
+		// component scale into the mesh asset's BuildScale (render-identical)
+		// and reset every component using that asset to scale 1, BEFORE
+		// collision/mass generation reads the mesh bounds.
+		{
+			TMap<UStaticMesh*, FVector> BakeScaleByMesh;
+			for (TPair<USCS_Node*, FRigBody>& Pair : Bodies)
+			{
+				if (!Pair.Value.VizNode)
+				{
+					continue;
+				}
+				UStaticMeshComponent* Viz =
+					Cast<UStaticMeshComponent>(Pair.Value.VizNode->ComponentTemplate);
+				UStaticMesh* Mesh = Viz ? Viz->GetStaticMesh() : nullptr;
+				if (!Mesh)
+				{
+					continue;
+				}
+				const FVector Scale = ChainToAncestor(Pair.Value.VizNode, nullptr).GetScale3D();
+				if (Scale.Equals(FVector::OneVector, 1e-3f))
+				{
+					continue;
+				}
+				if (const FVector* Prev = BakeScaleByMesh.Find(Mesh))
+				{
+					if (!Prev->Equals(Scale, 1e-6f))
+					{
+						UE_LOG(LogRammsRig, Warning,
+							TEXT("mesh %s used at conflicting scales (%s vs %s) — not baking"),
+							*Mesh->GetName(), *Prev->ToString(), *Scale.ToString());
+						BakeScaleByMesh.Remove(Mesh);
+					}
+					continue;
+				}
+				BakeScaleByMesh.Add(Mesh, Scale);
+			}
+			if (BakeScaleByMesh.Num())
+			{
+				for (TPair<UStaticMesh*, FVector>& MB : BakeScaleByMesh)
+				{
+					UStaticMesh* Mesh = MB.Key;
+					Mesh->Modify();
+					for (int32 Lod = 0; Lod < Mesh->GetNumSourceModels(); ++Lod)
+					{
+						FStaticMeshSourceModel& Src = Mesh->GetSourceModel(Lod);
+						Src.BuildSettings.BuildScale3D *= MB.Value;
+					}
+					Mesh->PostEditChange(); // synchronous rebuild in editor
+					Mesh->MarkPackageDirty();
+					ModifiedMeshPackages.Add(Mesh->GetOutermost());
+				}
+				int32 Reset = 0;
+				for (USCS_Node* Node : SCS->GetAllNodes())
+				{
+					UStaticMeshComponent* SMC =
+						Cast<UStaticMeshComponent>(Node->ComponentTemplate);
+					if (!SMC || !SMC->GetStaticMesh())
+					{
+						continue;
+					}
+					const FVector* Baked = BakeScaleByMesh.Find(SMC->GetStaticMesh());
+					if (!Baked)
+					{
+						continue;
+					}
+					SMC->Modify();
+					SMC->SetRelativeScale3D(SMC->GetRelativeScale3D() / *Baked);
+					++Reset;
+				}
+				UE_LOG(LogRammsRig, Display,
+					TEXT("unit-scale pre-pass: baked BuildScale into %d meshes, reset %d components"),
+					BakeScaleByMesh.Num(), Reset);
+			}
+		}
+
 		for (TPair<USCS_Node*, FRigBody>& Pair : Bodies)
 		{
 			FRigBody& Body = Pair.Value;
@@ -1131,14 +1214,16 @@ namespace
 						// commanded wheels crept at idle strength). Casters have
 						// no drives and roll freely.
 						CI.SetAngularVelocityDriveTwistAndSwing(true, false);
-						// 2e5 = 20 N*m per rad/s. 2e6 (a HARD brake) turned every
-						// elevator/caster stroke into propulsion: the carriage
-						// swings the braked wheel along the floor and the wheel's
-						// grip pushes the robot (measured: elevator -0.06 -> robot
-						// drives off at 25 cm/s; caster strokes 6-14 cm/s). 2e5
-						// still holds the chair at rest (creep <2 cm/s with the
-						// finger drives fixed) yet yields to carriage motion.
-						CI.SetAngularDriveParams(0.f, 2e5f, 0.f);
+						// 8e5 = 80 N*m per rad/s. History: 2e6 (a HARD brake)
+						// turned every elevator/caster stroke into propulsion
+						// (the carriage swings the braked wheel along the floor
+						// and the wheel's grip pushes the robot); 2e5 stopped
+						// that but let the undriven chair roll far too freely
+						// when pushed (user feedback 2026-08-18 — a powered
+						// wheelchair's motors resist back-driving). 8e5 is the
+						// middle: strong rolling resistance at zero command,
+						// still yields to deliberate carriage strokes.
+						CI.SetAngularDriveParams(0.f, 8e5f, 0.f);
 						Switch->DriveJoints.Add(*JointMjName);
 						Switch->DriveConstraints.Add(*CName);
 						Switch->DriveIsLinear.Add(false);
