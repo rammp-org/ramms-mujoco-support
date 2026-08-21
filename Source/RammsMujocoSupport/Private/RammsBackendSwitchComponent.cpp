@@ -59,6 +59,22 @@ namespace RammsChaosDbg
 			 "constraint at ApplyChaos (whole-assembly momentum-injection "
 			 "experiment)."));
 
+	static float				   WheelBrakeScale = 1.f;
+	static FAutoConsoleVariableRef CVarWheelBrakeScale(
+		TEXT("Ramms.Debug.WheelBrakeScale"), WheelBrakeScale,
+		TEXT("Scale the drive-wheel velocity-brake force limit at ApplyChaos "
+			 "(1 = baked). Suspension articulation drags the braked wheels "
+			 "along the floor; their grip is an EXTERNAL ground force that can "
+			 "launch the robot."));
+
+	static float				   RodForceCap = 0.f;
+	static FAutoConsoleVariableRef CVarRodForceCap(
+		TEXT("Ramms.Debug.RodForceCap"), RodForceCap,
+		TEXT("If > 0, override the caster motor-rod linear drive force limit "
+			 "(kg*cm/s^2; 1e5 = 1 kN) at ApplyChaos. The baked 3 kN cap was "
+			 "calibrated against the broken-frame rig; on the freed linkage a "
+			 "full-force stroke launches the robot."));
+
 	static bool					   bDisableArmDrives = false;
 	static FAutoConsoleVariableRef CVarDisableArmDrives(
 		TEXT("Ramms.Debug.DisableArmDrives"), bDisableArmDrives,
@@ -121,6 +137,14 @@ namespace RammsChaosDbg
 		if (FParse::Param(FCommandLine::Get(), TEXT("RammsDisableArmDrives")))
 		{
 			bDisableArmDrives = true;
+		}
+		if (FParse::Value(FCommandLine::Get(), TEXT("RammsRodForceCap="), V))
+		{
+			RodForceCap = V;
+		}
+		if (FParse::Value(FCommandLine::Get(), TEXT("RammsWheelBrakeScale="), V))
+		{
+			WheelBrakeScale = V;
 		}
 	}
 } // namespace RammsChaosDbg
@@ -550,6 +574,33 @@ void URammsBackendSwitchComponent::ApplyChaos()
 			&& C->GetName().StartsWith(TEXT("ChaosRig_")))
 		{
 			C->ConstraintInstance.ProfileInstance.bEnableProjection = false;
+		}
+		// Tuning aid (Ramms.Debug.WheelBrakeScale): scale the drive-wheel
+		// brake force limit without a regen.
+		if (RammsChaosDbg::WheelBrakeScale != 1.f
+			&& (C->GetName().StartsWith(TEXT("ChaosRig_drive_wheel"))))
+		{
+			FConstraintInstance&	XCI = C->ConstraintInstance;
+			const FConstraintDrive& TD = XCI.ProfileInstance.AngularDrive.TwistDrive;
+			if (TD.bEnableVelocityDrive)
+			{
+				const float BaseCap = TD.MaxForce > 0.f ? TD.MaxForce : 6e5f;
+				XCI.SetAngularDriveParams(TD.Stiffness, TD.Damping,
+					BaseCap * RammsChaosDbg::WheelBrakeScale);
+				UE_LOG(LogTemp, Display, TEXT("[ApplyChaos] wheel brake cap x%.2f on %s"),
+					RammsChaosDbg::WheelBrakeScale, *C->GetName());
+			}
+		}
+		// Tuning aid (Ramms.Debug.RodForceCap): override the caster rod servo
+		// force limit without a regen.
+		if (RammsChaosDbg::RodForceCap > 0.f
+			&& C->GetName().Contains(TEXT("caster_motor_rod")))
+		{
+			FConstraintInstance&	XCI = C->ConstraintInstance;
+			const FConstraintDrive& XD = XCI.ProfileInstance.LinearDrive.XDrive;
+			XCI.SetLinearDriveParams(XD.Stiffness, XD.Damping, RammsChaosDbg::RodForceCap);
+			UE_LOG(LogTemp, Display, TEXT("[ApplyChaos] rod force cap %.0f on %s"),
+				RammsChaosDbg::RodForceCap, *C->GetName());
 		}
 		// Bisect aid (Ramms.Debug.DisableArmDrives): strip the 7-DOF arm's
 		// joint drives (NOT the gripper's).

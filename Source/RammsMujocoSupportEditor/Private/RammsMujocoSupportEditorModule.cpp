@@ -1074,6 +1074,13 @@ namespace
 					// of extending, wedging 6 kN into the chassis (fly-apart).
 					CI.SetLinearXLimit(LCM_Limited,
 						(RangeSrc->range[1] - RangeSrc->range[0]) * 0.5f);
+					// HARD stop: UE linear limits default SOFT (stiffness-50
+					// mush). Measured on caster-rod strokes: a launch transient
+					// tore the front rod 43 cm outside its +-8 cm track through
+					// the soft limit, dragging the linkage pin into impossible
+					// geometry — the wedged loop then pumps energy until the
+					// robot flies. MuJoCo enforces slide ranges stiffly.
+					CI.ProfileInstance.LinearLimit.bSoftConstraint = false;
 				}
 				else
 				{
