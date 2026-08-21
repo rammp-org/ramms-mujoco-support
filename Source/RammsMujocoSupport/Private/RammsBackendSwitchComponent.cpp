@@ -52,6 +52,30 @@ namespace RammsChaosDbg
 			 "at ApplyChaos (UE default is 0 — angular error is never "
 			 "projected; 0 = leave as configured)."));
 
+	static bool					   bDisableAllProjection = false;
+	static FAutoConsoleVariableRef CVarDisableAllProjection(
+		TEXT("Ramms.Debug.DisableAllProjection"), bDisableAllProjection,
+		TEXT("Bisect aid: force bEnableProjection=false on EVERY ChaosRig "
+			 "constraint at ApplyChaos (whole-assembly momentum-injection "
+			 "experiment)."));
+
+	static bool					   bDisableArmDrives = false;
+	static FAutoConsoleVariableRef CVarDisableArmDrives(
+		TEXT("Ramms.Debug.DisableArmDrives"), bDisableArmDrives,
+		TEXT("Bisect aid: strip the 7-DOF arm joint drives (ChaosRig_arm_* "
+			 "minus the 2f85 gripper) at ApplyChaos — arm PD gains converted "
+			 "from MuJoCo kp are far above the 60 Hz explicit-solver stability "
+			 "limit for the light wrist links."));
+
+	static bool					   bDisableGripperProjection = false;
+	static FAutoConsoleVariableRef CVarDisableGripperProjection(
+		TEXT("Ramms.Debug.DisableGripperProjection"), bDisableGripperProjection,
+		TEXT("Bisect aid: force bEnableProjection=false on every arm_2f85 "
+			 "constraint at ApplyChaos (projection-velocity-pump experiment: "
+			 "projection teleports position but never corrects velocity, so an "
+			 "inconsistent loop can accumulate unbounded body velocity while "
+			 "looking stationary)."));
+
 	// GOTCHA (2026-08-18, measured): -ExecCmds are DEFERRED commands — the
 	// engine executes them AFTER the first world tick, i.e. AFTER ApplyChaos
 	// has already re-initialized every constraint in a headless -game run.
@@ -85,6 +109,18 @@ namespace RammsChaosDbg
 		if (FParse::Param(FCommandLine::Get(), TEXT("RammsDisableGripperPins")))
 		{
 			bDisableGripperPins = true;
+		}
+		if (FParse::Param(FCommandLine::Get(), TEXT("RammsDisableGripperProjection")))
+		{
+			bDisableGripperProjection = true;
+		}
+		if (FParse::Param(FCommandLine::Get(), TEXT("RammsDisableAllProjection")))
+		{
+			bDisableAllProjection = true;
+		}
+		if (FParse::Param(FCommandLine::Get(), TEXT("RammsDisableArmDrives")))
+		{
+			bDisableArmDrives = true;
 		}
 	}
 } // namespace RammsChaosDbg
@@ -498,6 +534,34 @@ void URammsBackendSwitchComponent::ApplyChaos()
 		{
 			C->ConstraintInstance.ProfileInstance.bEnableProjection = false;
 		}
+		// Bisect aid (Ramms.Debug.DisableGripperProjection): projection can
+		// mask a loop inconsistency as ever-growing body velocity.
+		if (RammsChaosDbg::bDisableGripperProjection
+			&& C->GetName().StartsWith(TEXT("ChaosRig_arm_2f85_")))
+		{
+			C->ConstraintInstance.ProfileInstance.bEnableProjection = false;
+		}
+		// Bisect aid (Ramms.Debug.DisableAllProjection): projection teleports
+		// POSITION without touching velocity and ignores momentum conservation
+		// — over an inconsistent closure-loop network it can act as a
+		// continuous thrust on the whole assembly (measured: the entire robot
+		// coherently accelerating to 100+ m/s in mid-air at rest commands).
+		if (RammsChaosDbg::bDisableAllProjection
+			&& C->GetName().StartsWith(TEXT("ChaosRig_")))
+		{
+			C->ConstraintInstance.ProfileInstance.bEnableProjection = false;
+		}
+		// Bisect aid (Ramms.Debug.DisableArmDrives): strip the 7-DOF arm's
+		// joint drives (NOT the gripper's).
+		if (RammsChaosDbg::bDisableArmDrives
+			&& C->GetName().StartsWith(TEXT("ChaosRig_arm_"))
+			&& !C->GetName().StartsWith(TEXT("ChaosRig_arm_2f85_")))
+		{
+			FConstraintInstance& XCI = C->ConstraintInstance;
+			XCI.SetOrientationDriveTwistAndSwing(false, false);
+			XCI.SetAngularVelocityDriveTwistAndSwing(false, false);
+			XCI.SetAngularDriveParams(0.f, 0.f, 0.f);
+		}
 		// Bisect aid (Ramms.Debug.DisableGripperDrives): strip the gripper
 		// hinge drives to separate constraint-geometry torque from drive
 		// dynamics (used to isolate the four-bar rest-pose walk).
@@ -571,13 +635,31 @@ void URammsBackendSwitchComponent::ApplyChaos()
 			XCI.SetRefFrame(EConstraintFrame::Frame1, F1);
 			if (XCI.ProfileInstance.AngularDrive.TwistDrive.bEnablePositionDrive)
 			{
-				// Hold the SPAWN pose (physical 0 = measured -center), not
-				// the window center.
+				// Compose the BAKED drive target with the recentered frame
+				// (measured twist = physical - center). The baked roll is 0
+				// for plain rest holds — physical 0, i.e. hold the spawn
+				// pose — and -springref for preload springs (2f85
+				// spring_link), which must keep pulling toward the MJCF
+				// spring equilibrium, not get overwritten into a park.
+				const float BakedRad = FMath::DegreesToRadians(
+					XCI.ProfileInstance.AngularDrive.OrientationTarget.Roll);
 				XCI.SetAngularOrientationTarget(
-					FQuat(FVector::XAxisVector, -CenterRad));
+					FQuat(FVector::XAxisVector, BakedRad - CenterRad));
 			}
 		}
 		C->InitComponentConstraint();
+		// Verify the LIVE binding: Init resolves ComponentName1/2 by EXACT
+		// FName, so a suffix-drifted instance (shared-asset viz uniquification)
+		// or a stale body handle silently yields a dead joint — observed as the
+		// entire wrist+gripper assembly departing the robot as one intact
+		// cluster at ~100 m/s while every relative metric looked healthy.
+		if (!C->ConstraintInstance.IsValidConstraintInstance())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[ApplyChaos] DEAD CONSTRAINT after init: %s (P1=%s P2=%s)"),
+				*C->GetName(), *C->ComponentName1.ComponentName.ToString(),
+				*C->ComponentName2.ComponentName.ToString());
+		}
 		++NumInited;
 	}
 	if (NumInited < ChaosConstraintComponents.Num())

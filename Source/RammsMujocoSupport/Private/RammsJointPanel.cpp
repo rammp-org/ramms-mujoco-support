@@ -439,6 +439,11 @@ namespace
 			TArray<TPair<FName, float>>					 BodyMasses;	 // kg, sampled once
 			TMap<FName, FQuat>							 GripInitRel;	 // body1^-1*body2 at t0
 			TMap<FName, float>							 GripDirectDeg;	 // true hinge angle
+			TMap<FName, FVector2D>						 BodySpeed;		 // X=accum, Y=max (cm/s)
+			TMap<FName, FVector>						 BodyLastPos;	 // world, for pos-delta speed
+			TMap<FName, FVector2D>						 BodyPosSpeed;	 // X=accum, Y=max (cm/s)
+			double										 LastSampleTime = 0.0;
+			int32										 BodySpeedSamples = 0;
 		};
 		TSharedRef<FProbeState> St = MakeShared<FProbeState>();
 		St->Robot = Robot;
@@ -481,6 +486,46 @@ namespace
 						break;
 					}
 				}
+				// Per-body speed attribution: meanV alone can't say WHICH body
+				// is pumping (observed: base meanV 12k cm/s while upZ=1.0 and
+				// drift=0 — some rig body oscillating violently in place).
+				// BodyPosSpeed tracks the POSITION-DELTA speed at the sampling
+				// rate: if it stays near zero while the physics velocity reads
+				// 100 m/s, the velocity is phantom (solver-internal, positions
+				// clamped by constraints) rather than real displacement.
+				{
+					const double Now = W->GetTimeSeconds();
+					const double Dt = S->LastSampleTime > 0.0 ? Now - S->LastSampleTime : 0.0;
+					for (UPrimitiveComponent* P : Prims)
+					{
+						if (!P->IsSimulatingPhysics())
+						{
+							continue;
+						}
+						FVector2D&	BS = S->BodySpeed.FindOrAdd(P->GetFName());
+						const float Speed = P->GetPhysicsLinearVelocity().Size();
+						BS.X += Speed;
+						BS.Y = FMath::Max<double>(BS.Y, Speed);
+						const FVector Pos = P->GetComponentLocation();
+						if (FVector* Last = S->BodyLastPos.Find(P->GetFName()))
+						{
+							if (Dt > 1e-4)
+							{
+								FVector2D&	PS = S->BodyPosSpeed.FindOrAdd(P->GetFName());
+								const float PosSpeed = (Pos - *Last).Size() / Dt;
+								PS.X += PosSpeed;
+								PS.Y = FMath::Max<double>(PS.Y, PosSpeed);
+							}
+							*Last = Pos;
+						}
+						else
+						{
+							S->BodyLastPos.Add(P->GetFName(), Pos);
+						}
+					}
+					S->LastSampleTime = Now;
+				}
+				++S->BodySpeedSamples;
 				// One-shot mass audit: what does Chaos ACTUALLY simulate per
 				// rig body? (BodyMasses records intent; floors/overrides/
 				// auto-mass can diverge — wrong distribution reads as "the
@@ -652,12 +697,12 @@ namespace
 					const FVector Drift = Robot->GetActorLocation() - S->StartLoc;
 					const FVector Up = Robot->GetActorQuat().GetUpVector();
 					FString		  Report = FString::Printf(
-						  TEXT("=== Ramms.Probe %s ===\n  upZ=%.2f  drift=%.1f cm  ")
-							  TEXT("meanV=%.2f cm/s  maxV=%.2f cm/s  ")
-								  TEXT("(constraints: %d seen, %d rig)\n"),
-						  *Robot->GetActorNameOrLabel(), Up.Z, Drift.Size2D(),
-						  S->Samples ? S->SpeedAccum / S->Samples : -1.f, S->MaxSpeed,
-						  S->LastConsSeen, S->LastConsMatched);
+						TEXT("=== Ramms.Probe %s ===\n  upZ=%.2f  drift=%.1f cm  ")
+							TEXT("meanV=%.2f cm/s  maxV=%.2f cm/s  ")
+								TEXT("(constraints: %d seen, %d rig)\n"),
+						*Robot->GetActorNameOrLabel(), Up.Z, Drift.Size2D(),
+						S->Samples ? S->SpeedAccum / S->Samples : -1.f, S->MaxSpeed,
+						S->LastConsSeen, S->LastConsMatched);
 					TArray<FName> Keys;
 					S->TwistFirstLast.GenerateKeyArray(Keys);
 					Keys.Sort(FNameLexicalLess());
@@ -695,6 +740,46 @@ namespace
 							Direct ? *FString::Printf(TEXT("  direct=%.1f deg"), *Direct)
 								   : TEXT(""),
 							*LiveCfg);
+					}
+					// Fastest bodies: attributes the meanV energy to specific rig
+					// pieces (a violent in-place oscillator shows up here with
+					// near-zero net drift).
+					if (S->BodySpeedSamples > 0)
+					{
+						TArray<TPair<FName, FVector2D>> Fast;
+						for (const TPair<FName, FVector2D>& BP : S->BodySpeed)
+						{
+							Fast.Add(BP);
+						}
+						Fast.Sort([](const TPair<FName, FVector2D>& A, const TPair<FName, FVector2D>& B) {
+							return A.Value.X > B.Value.X;
+						});
+						const int32 NumFast = FMath::Min(Fast.Num(), 8);
+						for (int32 FI = 0; FI < NumFast; ++FI)
+						{
+							const FVector2D* PS = S->BodyPosSpeed.Find(Fast[FI].Key);
+							Report += FString::Printf(
+								TEXT("  bodyV %-58s mean=%8.1f max=%8.1f cm/s  posV mean=%8.1f max=%8.1f cm/s\n"),
+								*Fast[FI].Key.ToString(),
+								Fast[FI].Value.X / S->BodySpeedSamples, Fast[FI].Value.Y,
+								PS ? PS->X / FMath::Max(1, S->BodySpeedSamples - 1) : -1.f,
+								PS ? PS->Y : -1.f);
+						}
+					}
+					// ABSOLUTE end positions of key bodies. drift/upZ read the
+					// (non-simulated) actor ROOT and stay perfect even when the
+					// whole physics assembly departs — a regen against broken
+					// source content once had the entire robot coherently flying
+					// at 100 m/s while every relative metric looked healthy.
+					for (const TPair<FName, FVector>& BP : S->BodyLastPos)
+					{
+						if (BP.Key.ToString().Contains(TEXT("chassis"))
+							|| BP.Key.ToString().Contains(TEXT("2f85_pad"))
+							|| BP.Key.ToString().Contains(TEXT("drive_wheel")))
+						{
+							Report += FString::Printf(TEXT("  endpos %-58s %s\n"),
+								*BP.Key.ToString(), *BP.Value.ToCompactString());
+						}
 					}
 					// Mass audit: totals + the heaviest bodies (full per-body
 					// list only in the file dump).

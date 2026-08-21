@@ -308,6 +308,13 @@ namespace
 		Setup->CreatePhysicsMeshes();
 		Mesh->MarkPackageDirty();
 
+		// Robot self-collision is masked at RUNTIME, not here: ApplyChaos puts
+		// every rig body on the RobotSelf channel (ECC_GameTraceChannel2,
+		// ignore-self / block-world), reproducing the MJCF contype/conaffinity
+		// scheme. Template-level collision settings on the viz components are
+		// overwritten by ApplyChaos's SetCollisionProfileName pass, so do not
+		// configure responses here — they would be silently discarded.
+
 		// Extra visual pieces keep their import-time auto collision, which shows
 		// up as stray sphere/box colliders on wheels in the collision view (and
 		// confuses debugging even though the pieces are NoCollision at runtime).
@@ -888,8 +895,8 @@ namespace
 					// travel without the solver fight.
 					const float Ref = RefSrc->bOverride_ref ? RefSrc->ref : 0.f;
 					float		Half = FMath::Max(
-						  FMath::Abs(RangeSrc->range[1] - Ref),
-						  FMath::Abs(Ref - RangeSrc->range[0]));
+						FMath::Abs(RangeSrc->range[1] - Ref),
+						FMath::Abs(Ref - RangeSrc->range[0]));
 					// (A 15-deg clamp on the suspension arms was tried as a
 					// strut stand-in and DETONATED — window spring vs rod
 					// force is the classic limits-vs-loops energy pump. The
@@ -934,7 +941,27 @@ namespace
 					const bool bArm = Pair.Key->GetVariableName().ToString().StartsWith(TEXT("arm_"));
 					float	   Stiff = FMath::Min(RawStiff * 1e4f * SpringMassScale, 2e6f);
 					float	   Damp = FMath::Min(
-						 (J->damping.Num() ? J->damping[0] : 0.f) * 1e4f * SpringMassScale, 2e5f);
+						(J->damping.Num() ? J->damping[0] : 0.f) * 1e4f * SpringMassScale, 2e5f);
+					// springref joints (2f85 spring_link) are PRELOAD springs in
+					// MuJoCo (equilibrium 150 deg, far outside the window). Two
+					// literal emulations FAILED here: an uncapped stiffness-
+					// floored spawn hold (5e4/1.5e4) rigidly parked the bar
+					// (user: "secondary bar can't rotate"), and a true drive
+					// target at -springref loaded the loop against its HARD
+					// windows — measured: drivers dragged to the 23 deg window
+					// edge and the whole finger chain buzzed at 120 m/s mean
+					// body speed (the classic limits-vs-loops energy pump,
+					// gotcha 15). The emulation that captures the FUNCTION is a
+					// FORCE-LIMITED spawn hold (see the drive params below):
+					// full 1.5e4 gradient holds rest crisply, but the torque
+					// saturates at ~0.25 N*m — just above the real preload
+					// (0.05 x 2.6 rad = 0.13 N*m) and well under the driver's
+					// authority, so a commanded close simply overpowers it and
+					// the four-bar articulates like MuJoCo's.
+					const UMjJoint* SpringRefSrc = ResolveJointTemplate(J,
+						[](const UMjJoint* X) { return X->bOverride_springref; });
+					const bool		bSpringRef = bArm && SpringRefSrc->bOverride_springref
+						&& FMath::Abs(SpringRefSrc->springref) > 0.01f;
 					if (bArm && SpringMassScale > 1.f)
 					{
 						// 1.5e4 = 1.5 N*m/rad, paired with the LIGHTER 0.05 kg
@@ -1012,14 +1039,16 @@ namespace
 					{
 						CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
 						CI.SetOrientationDriveTwistAndSwing(true, false);
-						CI.SetAngularDriveParams(Stiff, Damp, 0.f);
+						// Preload springs saturate at ~0.25 N*m (2.5e3); see the
+						// springref comment above.
+						CI.SetAngularDriveParams(Stiff, Damp, bSpringRef ? 2.5e3f : 0.f);
 					}
 					if (Pair.Key->GetVariableName().ToString().StartsWith(TEXT("arm_")))
 					{
 						UE_LOG(LogRammsRig, Display,
-							TEXT("spring drive %s: raw=%.4f scale=%.1f -> stiff=%.0f damp=%.0f"),
+							TEXT("spring drive %s: raw=%.4f scale=%.1f -> stiff=%.0f damp=%.0f springref=%.1f"),
 							*Pair.Key->GetVariableName().ToString(), RawStiff, SpringMassScale,
-							Stiff, Damp);
+							Stiff, Damp, bSpringRef ? SpringRefSrc->springref : 0.f);
 					}
 				}
 				// (Damping-only hinges deliberately get NO velocity drive: adding
@@ -1080,7 +1109,15 @@ namespace
 				// 1 N*m per rad/s: 0.2 was too weak to stop the parked robot
 				// coasting on its casters; drive-wheel torque (20 N*m scale)
 				// still rolls them easily.
-				CI.SetAngularDriveParams(0.f, 1e4f, 0.f);
+				// TORQUE-CAPPED at 1 N*m (Coulomb-style): uncapped, this damper
+				// grows with speed — at travel pace (~5 rad/s) each caster
+				// dragged ~5 N*m, ~100+ N of ground drag total, which reads as
+				// "rear casters have high friction" and starves the drive
+				// wheels into slip. The cap keeps the full anti-creep hold at
+				// rest (creep speeds < 1 rad/s never hit it) but bounds rolling
+				// drag under way at 4 N*m total, comparable to MuJoCo's
+				// damping+frictionloss on these wheels.
+				CI.SetAngularDriveParams(0.f, 1e4f, 1e4f);
 			}
 
 			// Actuated joint? Configure the constraint drive and record the
@@ -1261,7 +1298,14 @@ namespace
 						// wheelchair's motors resist back-driving). 8e5 is the
 						// middle: strong rolling resistance at zero command,
 						// still yields to deliberate carriage strokes.
-						CI.SetAngularDriveParams(0.f, 8e5f, 0.f);
+						// TORQUE-CAPPED at the MJCF motor limit (gear 60 x ctrl
+						// 1 = 60 N*m = 6e5): an unlimited brake/tracker can
+						// demand more contact force than the tire has, so the
+						// wheel skids instead of rolling ("drive wheels have
+						// very low friction") and linkage strokes react through
+						// an effectively rigid wheel. The cap is exactly what
+						// the real motor can do, for braking AND tracking alike.
+						CI.SetAngularDriveParams(0.f, 8e5f, 6e5f);
 						Switch->DriveJoints.Add(*JointMjName);
 						Switch->DriveConstraints.Add(*CName);
 						Switch->DriveIsLinear.Add(false);
@@ -1579,15 +1623,15 @@ namespace
 			// window angle). Prefer a HINGE axis from either side.
 			FVector PinAxis(0.f, -1.f, 0.f);
 			auto	HingeAxisOf = [&ResolveJointTemplate](const FRigBody* R, FVector& Out) -> bool {
-				   if (!R->Joint || !Cast<UMjHingeJoint>(R->Joint))
-				   {
-					   return false;
-				   }
-				   const UMjJoint* AS = ResolveJointTemplate(R->Joint,
-					   [](const UMjJoint* X) { return X->bOverride_Axis; });
-				   Out = (AS->bOverride_Axis ? AS->Axis : FVector(0, 0, 1))
-							 .GetSafeNormal(1e-6f, FVector(0, -1, 0));
-				   return true;
+				if (!R->Joint || !Cast<UMjHingeJoint>(R->Joint))
+				{
+					return false;
+				}
+				const UMjJoint* AS = ResolveJointTemplate(R->Joint,
+					[](const UMjJoint* X) { return X->bOverride_Axis; });
+				Out = (AS->bOverride_Axis ? AS->Axis : FVector(0, 0, 1))
+						  .GetSafeNormal(1e-6f, FVector(0, -1, 0));
+				return true;
 			};
 			if (!HingeAxisOf(R1, PinAxis))
 			{
@@ -1716,7 +1760,7 @@ namespace
 				{
 					const FString SName = TEXT("ChaosRig_strut_rear_caster");
 					USCS_Node*	  SNode = SCS->CreateNode(
-						   UPhysicsConstraintComponent::StaticClass(), *SName);
+						UPhysicsConstraintComponent::StaticClass(), *SName);
 					B1->AddChildNode(SNode);
 					UPhysicsConstraintComponent* SC2 =
 						Cast<UPhysicsConstraintComponent>(SNode->ComponentTemplate);
