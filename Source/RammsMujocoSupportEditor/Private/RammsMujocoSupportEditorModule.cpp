@@ -152,14 +152,24 @@ namespace
 		if (UPhysicalMaterial* Existing = LoadObject<UPhysicalMaterial>(nullptr, *ObjPath))
 		{
 			// Keep the saved asset in sync with the generator's values (the
-			// caster material was retuned after first creation).
+			// caster material was retuned after first creation). Restitution
+			// included: assets created before the Restitution=0 line kept the
+			// UE default 0.3 — genuinely bouncy tires, visible as the parked
+			// robot bouncing/oscillating at rest (user report). Min-combine so
+			// the floor's material (default restitution 0.3) cannot average
+			// bounce back in.
 			if (!FMath::IsNearlyEqual(Existing->Friction, Friction)
-				|| Existing->FrictionCombineMode != Combine)
+				|| Existing->FrictionCombineMode != Combine
+				|| Existing->Restitution > 0.f
+				|| Existing->RestitutionCombineMode != EFrictionCombineMode::Min)
 			{
 				Existing->Modify();
 				Existing->Friction = Friction;
 				Existing->bOverrideFrictionCombineMode = true;
 				Existing->FrictionCombineMode = Combine;
+				Existing->Restitution = 0.f;
+				Existing->bOverrideRestitutionCombineMode = true;
+				Existing->RestitutionCombineMode = EFrictionCombineMode::Min;
 				Existing->MarkPackageDirty();
 			}
 			return Existing;
@@ -177,6 +187,8 @@ namespace
 		PM->bOverrideFrictionCombineMode = true;
 		PM->FrictionCombineMode = Combine;
 		PM->Restitution = 0.f;
+		PM->bOverrideRestitutionCombineMode = true;
+		PM->RestitutionCombineMode = EFrictionCombineMode::Min;
 		PM->MarkPackageDirty();
 		{
 			TArray<UPackage*> ToSave;

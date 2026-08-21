@@ -439,16 +439,20 @@ namespace
 			TArray<TPair<FName, float>>					 BodyMasses;	 // kg, sampled once
 			TMap<FName, FQuat>							 GripInitRel;	 // body1^-1*body2 at t0
 			TMap<FName, float>							 GripDirectDeg;	 // true hinge angle
-			TMap<FName, FVector2D>						 BodySpeed;		 // X=accum, Y=max (cm/s)
-			TMap<FName, FVector>						 BodyLastPos;	 // world, for pos-delta speed
-			TMap<FName, FVector2D>						 BodyPosSpeed;	 // X=accum, Y=max (cm/s)
-			double										 LastSampleTime = 0.0;
-			int32										 BodySpeedSamples = 0;
+			double										 StartTime = 0.0;
+			FVector2D									 ChassisZRange =
+				FVector2D(TNumericLimits<float>::Max(), TNumericLimits<float>::Lowest());
+			TMap<FName, FVector2D> BodySpeed;	 // X=accum, Y=max (cm/s)
+			TMap<FName, FVector>   BodyLastPos;	 // world, for pos-delta speed
+			TMap<FName, FVector2D> BodyPosSpeed; // X=accum, Y=max (cm/s)
+			double				   LastSampleTime = 0.0;
+			int32				   BodySpeedSamples = 0;
 		};
 		TSharedRef<FProbeState> St = MakeShared<FProbeState>();
 		St->Robot = Robot;
 		St->Sw = Sw;
 		St->StartLoc = Robot->GetActorLocation();
+		St->StartTime = World->GetTimeSeconds();
 		St->EndTime = World->GetTimeSeconds() + FMath::Max(Seconds, 0.5f);
 
 		TSharedRef<FTimerHandle> Handle = MakeShared<FTimerHandle>();
@@ -483,6 +487,16 @@ namespace
 						S->MaxSpeed = FMath::Max(S->MaxSpeed, Speed);
 						S->SpeedAccum += Speed;
 						++S->Samples;
+						// Rest-bounce metric: base body Z range AFTER the spawn
+						// settle (first 3 s excluded). A parked robot should
+						// show sub-mm here; the user-visible "bouncing at rest"
+						// reads as an amplitude in mm-cm.
+						if (W->GetTimeSeconds() > S->StartTime + 3.0)
+						{
+							const float Z = P->GetComponentLocation().Z;
+							S->ChassisZRange.X = FMath::Min(S->ChassisZRange.X, (double)Z);
+							S->ChassisZRange.Y = FMath::Max(S->ChassisZRange.Y, (double)Z);
+						}
 						break;
 					}
 				}
@@ -740,6 +754,13 @@ namespace
 							Direct ? *FString::Printf(TEXT("  direct=%.1f deg"), *Direct)
 								   : TEXT(""),
 							*LiveCfg);
+					}
+					if (S->ChassisZRange.Y >= S->ChassisZRange.X)
+					{
+						Report += FString::Printf(
+							TEXT("  restZ: base Z %.3f..%.3f cm (amplitude %.2f mm, post-settle)\n"),
+							S->ChassisZRange.X, S->ChassisZRange.Y,
+							(S->ChassisZRange.Y - S->ChassisZRange.X) * 10.f);
 					}
 					// Fastest bodies: attributes the meanV energy to specific rig
 					// pieces (a violent in-place oscillator shows up here with
