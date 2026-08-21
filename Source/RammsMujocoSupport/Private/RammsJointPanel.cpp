@@ -442,6 +442,7 @@ namespace
 			double										 StartTime = 0.0;
 			FVector2D									 ChassisZRange =
 				FVector2D(TNumericLimits<float>::Max(), TNumericLimits<float>::Lowest());
+			TMap<FName, FVector2D> WheelOmega;	 // X=accum, Y=max (rad/s)
 			TMap<FName, FVector2D> BodySpeed;	 // X=accum, Y=max (cm/s)
 			TMap<FName, FVector>   BodyLastPos;	 // world, for pos-delta speed
 			TMap<FName, FVector2D> BodyPosSpeed; // X=accum, Y=max (cm/s)
@@ -520,6 +521,19 @@ namespace
 						const float Speed = P->GetPhysicsLinearVelocity().Size();
 						BS.X += Speed;
 						BS.Y = FMath::Max<double>(BS.Y, Speed);
+						// Wheel spin rate: with the chassis speed this separates
+						// slipping (spins, no travel) from a starved drive
+						// (cannot spin up) from a skidding caster (travel, no
+						// spin). The twist first->last metric WRAPS at 180 deg
+						// and is useless for multi-turn rolling.
+						if (P->GetFName().ToString().Contains(TEXT("wheel")))
+						{
+							FVector2D&	WO = S->WheelOmega.FindOrAdd(P->GetFName());
+							const float Omega =
+								P->GetPhysicsAngularVelocityInRadians().Size();
+							WO.X += Omega;
+							WO.Y = FMath::Max<double>(WO.Y, Omega);
+						}
 						const FVector Pos = P->GetComponentLocation();
 						if (FVector* Last = S->BodyLastPos.Find(P->GetFName()))
 						{
@@ -754,6 +768,24 @@ namespace
 							Direct ? *FString::Printf(TEXT("  direct=%.1f deg"), *Direct)
 								   : TEXT(""),
 							*LiveCfg);
+					}
+					if (S->BodySpeedSamples > 0)
+					{
+						TArray<TPair<FName, FVector2D>> Wheels;
+						for (const TPair<FName, FVector2D>& WP : S->WheelOmega)
+						{
+							Wheels.Add(WP);
+						}
+						Wheels.Sort([](const TPair<FName, FVector2D>& A, const TPair<FName, FVector2D>& B) {
+							return A.Key.LexicalLess(B.Key);
+						});
+						for (const TPair<FName, FVector2D>& WP : Wheels)
+						{
+							Report += FString::Printf(
+								TEXT("  wheelW %-58s mean=%6.2f max=%6.2f rad/s\n"),
+								*WP.Key.ToString(), WP.Value.X / S->BodySpeedSamples,
+								WP.Value.Y);
+						}
 					}
 					if (S->ChassisZRange.Y >= S->ChassisZRange.X)
 					{
