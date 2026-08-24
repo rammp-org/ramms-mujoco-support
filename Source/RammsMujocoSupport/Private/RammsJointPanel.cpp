@@ -1029,6 +1029,74 @@ namespace
 			 "— minimal 2-cube hinge repro of the gripper driver constraint."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&ReproHinge));
 
+	// Slider-drag reproduction: the Ramms.Panel slider streams intermediate
+	// targets through SetJointCommand on every mouse move; a one-shot
+	// Ramms.Joint step behaves differently (measured: full-range shoulder
+	// STEPS keep the base upright while panel DRAGS flipped it for the
+	// user). This replays a drag headlessly at UI rate.
+	//   Ramms.JointSweep <ActorLabel> <Joint> <From> <To> <Seconds>
+	static FAutoConsoleCommandWithWorldAndArgs GRammsJointSweepCmd(
+		TEXT("Ramms.JointSweep"),
+		TEXT("Ramms.JointSweep <ActorLabel> <Joint> <From> <To> <Seconds> — "
+			 "stream interpolated targets through SetJointCommand at ~60 Hz, "
+			 "emulating a Ramms.Panel slider drag."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			[](const TArray<FString>& Args, UWorld* World) {
+				if (Args.Num() < 5 || !World)
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("usage: Ramms.JointSweep <ActorLabel> <Joint> <From> <To> <Seconds>"));
+					return;
+				}
+				URammsBackendSwitchComponent* Sw = nullptr;
+				for (TActorIterator<AActor> It(World); It; ++It)
+				{
+					if ((It->GetActorNameOrLabel() == Args[0] || It->GetName() == Args[0]))
+					{
+						Sw = It->FindComponentByClass<URammsBackendSwitchComponent>();
+						if (Sw)
+						{
+							break;
+						}
+					}
+				}
+				if (!Sw)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("Ramms.JointSweep: no actor '%s'"), *Args[0]);
+					return;
+				}
+				const FName									 Joint(*Args[1]);
+				const float									 From = FCString::Atof(*Args[2]);
+				const float									 To = FCString::Atof(*Args[3]);
+				const float									 Seconds = FMath::Max(FCString::Atof(*Args[4]), 0.05f);
+				const double								 Start = World->GetTimeSeconds();
+				TWeakObjectPtr<URammsBackendSwitchComponent> WeakSw = Sw;
+				TSharedRef<FTimerHandle>					 Handle = MakeShared<FTimerHandle>();
+				World->GetTimerManager().SetTimer(*Handle,
+					FTimerDelegate::CreateLambda(
+						[WeakSw, Joint, From, To, Seconds, Start, Handle, World]() {
+							TSharedRef<FTimerHandle>	  H = Handle; // keep alive this call
+							URammsBackendSwitchComponent* S = WeakSw.Get();
+							if (!S)
+							{
+								World->GetTimerManager().ClearTimer(*H);
+								return;
+							}
+							const float Alpha = FMath::Clamp(
+								(float)((World->GetTimeSeconds() - Start) / Seconds), 0.f, 1.f);
+							S->SetJointCommand(Joint, FMath::Lerp(From, To, Alpha));
+							if (Alpha >= 1.f)
+							{
+								UE_LOG(LogTemp, Display,
+									TEXT("Ramms.JointSweep %s done at %.3f"), *Joint.ToString(), To);
+								World->GetTimerManager().ClearTimer(*H);
+							}
+						}),
+					1.f / 60.f, true);
+				UE_LOG(LogTemp, Display, TEXT("Ramms.JointSweep %s %.3f -> %.3f over %.2fs"),
+					*Joint.ToString(), From, To, Seconds);
+			}));
+
 	FAutoConsoleCommandWithWorldAndArgs GRammsProbeCmd(
 		TEXT("Ramms.Probe"),
 		TEXT("Ramms.Probe [ActorLabel] [Seconds] — sample the rig and log base "
