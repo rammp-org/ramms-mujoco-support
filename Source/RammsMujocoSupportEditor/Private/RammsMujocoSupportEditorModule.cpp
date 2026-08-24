@@ -817,24 +817,33 @@ namespace
 
 			FConstraintInstance& CI = C->ConstraintInstance;
 			CI.ProfileInstance.bDisableCollision = true;
-			// Projection: the gripper couples 12-22 g links to the 8 kg arm
-			// through limits + closure loops — a ~400:1 mass ratio the 60 Hz
-			// solver pumps energy into (robot back-flipped at spawn) unless the
-			// error is projected out positionally.
-			CI.ProfileInstance.bEnableProjection = true;
-			// ANGULAR projection (gripper joints only): UE defaults
+			// Projection is GRIPPER-ONLY. It exists for the 2f85's ~400:1
+			// mass ratios (12-22 g links vs the 8 kg arm — the solver pumps
+			// energy into those without positional projection; robot
+			// back-flipped at spawn). On the mebot/arm joints projection is
+			// the opposite: it teleports position without conserving
+			// momentum, and under rhythmic load it is a runaway energy pump —
+			// measured with Ramms.JointSweep (shoulder 0<->1.2 rad, 1.5 s
+			// cycles): projection ON grew the base oscillation until the
+			// robot fell out of the world; projection OFF bounded the same
+			// input to a survivable hop. (Same mechanism as the earlier
+			// whole-robot 100 m/s coherent flight on the broken-content rig.)
+			// ANGULAR alpha 0.25 on the gripper: UE defaults
 			// ProjectionAngularAlpha to 0, so "projection on" only ever
 			// projected LINEAR error — the reason the gripper's linear rows
 			// enforced crisply while its angular windows leaked 10-40 deg
 			// under closure-loop load. Measured 2026-08-18 (rest, loop
 			// closed): alpha 0 -> stops overrun 9-16 deg; alpha 1 -> windows
 			// crisp but the pins tear to 0.15-0.23 cm; alpha 0.25 -> all
-			// windows respected AND pins 0.027-0.036 cm. Gripper only: the
-			// mebot ground loops detonate under hard angular enforcement
-			// (gotcha 15).
+			// windows respected AND pins 0.027-0.036 cm.
 			if (Pair.Key->GetVariableName().ToString().StartsWith(TEXT("arm_2f85_")))
 			{
+				CI.ProfileInstance.bEnableProjection = true;
 				CI.ProfileInstance.ProjectionAngularAlpha = 0.25f;
+			}
+			else
+			{
+				CI.ProfileInstance.bEnableProjection = false;
 			}
 			// UE-twist-space window center recorded for the runtime (deg;
 			// 0 = symmetric window, nothing to offset).

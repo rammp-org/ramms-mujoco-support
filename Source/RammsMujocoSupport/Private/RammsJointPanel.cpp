@@ -1065,16 +1065,19 @@ namespace
 					UE_LOG(LogTemp, Warning, TEXT("Ramms.JointSweep: no actor '%s'"), *Args[0]);
 					return;
 				}
-				const FName									 Joint(*Args[1]);
-				const float									 From = FCString::Atof(*Args[2]);
-				const float									 To = FCString::Atof(*Args[3]);
-				const float									 Seconds = FMath::Max(FCString::Atof(*Args[4]), 0.05f);
+				const FName Joint(*Args[1]);
+				const float From = FCString::Atof(*Args[2]);
+				const float To = FCString::Atof(*Args[3]);
+				const float Seconds = FMath::Max(FCString::Atof(*Args[4]), 0.05f);
+				// Optional 6th arg: ping-pong cycle count (a real slider drag
+				// jitters back and forth; one-way ramps missed that mode).
+				const int32									 Cycles = Args.Num() > 5 ? FMath::Max(FCString::Atoi(*Args[5]), 1) : 1;
 				const double								 Start = World->GetTimeSeconds();
 				TWeakObjectPtr<URammsBackendSwitchComponent> WeakSw = Sw;
 				TSharedRef<FTimerHandle>					 Handle = MakeShared<FTimerHandle>();
 				World->GetTimerManager().SetTimer(*Handle,
 					FTimerDelegate::CreateLambda(
-						[WeakSw, Joint, From, To, Seconds, Start, Handle, World]() {
+						[WeakSw, Joint, From, To, Seconds, Cycles, Start, Handle, World]() {
 							TSharedRef<FTimerHandle>	  H = Handle; // keep alive this call
 							URammsBackendSwitchComponent* S = WeakSw.Get();
 							if (!S)
@@ -1082,19 +1085,31 @@ namespace
 								World->GetTimerManager().ClearTimer(*H);
 								return;
 							}
-							const float Alpha = FMath::Clamp(
-								(float)((World->GetTimeSeconds() - Start) / Seconds), 0.f, 1.f);
-							S->SetJointCommand(Joint, FMath::Lerp(From, To, Alpha));
-							if (Alpha >= 1.f)
+							const float T = (float)((World->GetTimeSeconds() - Start) / Seconds);
+							if (T >= (float)Cycles)
 							{
+								S->SetJointCommand(Joint, To);
 								UE_LOG(LogTemp, Display,
 									TEXT("Ramms.JointSweep %s done at %.3f"), *Joint.ToString(), To);
 								World->GetTimerManager().ClearTimer(*H);
+								return;
 							}
+							float Alpha;
+							if (Cycles == 1)
+							{
+								Alpha = FMath::Clamp(T, 0.f, 1.f); // one-way ramp
+							}
+							else
+							{
+								// Triangle wave From->To->From per cycle.
+								const float Phase = FMath::Fmod(T, 1.f);
+								Alpha = Phase < 0.5f ? Phase * 2.f : (1.f - Phase) * 2.f;
+							}
+							S->SetJointCommand(Joint, FMath::Lerp(From, To, Alpha));
 						}),
 					1.f / 60.f, true);
-				UE_LOG(LogTemp, Display, TEXT("Ramms.JointSweep %s %.3f -> %.3f over %.2fs"),
-					*Joint.ToString(), From, To, Seconds);
+				UE_LOG(LogTemp, Display, TEXT("Ramms.JointSweep %s %.3f -> %.3f over %.2fs x%d"),
+					*Joint.ToString(), From, To, Seconds, Cycles);
 			}));
 
 	FAutoConsoleCommandWithWorldAndArgs GRammsProbeCmd(

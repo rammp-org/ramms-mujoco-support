@@ -322,7 +322,23 @@ void URammsBackendSwitchComponent::ApplyChaos()
 				// links are excluded — wheels must roll freely and the arm
 				// has its own PD drives.
 				const FString BodyName = Name.ToString();
-				const bool	  bLinkagePiece = !BodyName.StartsWith(TEXT("arm_"))
+				// CHASSIS rocking damping: rhythmic arm reversals near ~0.7 Hz
+				// resonate the base's pitch/heave mode on its wheel contacts —
+				// measured with Ramms.JointSweep (shoulder 0<->1.2 rad, 1.5 s
+				// cycles): amplitude grew until the robot fell out of the
+				// world, while 4 s cycles produced only a bounded 12 cm hop.
+				// The real robot damps this mode through its dampener struts,
+				// whose force path Chaos's iterative solver transmits poorly
+				// (the long-standing strut leak). Body-level damping on the
+				// chassis is the stand-in: angular damps pitch/roll rocking
+				// directly; the small linear term damps heave without
+				// meaningfully braking travel (~0.1/s on 267 kg).
+				if (BodyName.Contains(TEXT("mebot__chassis")))
+				{
+					Prim->SetAngularDamping(3.f);
+					Prim->SetLinearDamping(0.1f);
+				}
+				const bool bLinkagePiece = !BodyName.StartsWith(TEXT("arm_"))
 					&& !BodyName.Contains(TEXT("wheel"))
 					&& (BodyName.Contains(TEXT("linkage")) || BodyName.Contains(TEXT("rod"))
 						|| BodyName.Contains(TEXT("pivot")) || BodyName.Contains(TEXT("dampener"))
@@ -711,6 +727,23 @@ void URammsBackendSwitchComponent::ApplyChaos()
 				*C->GetName(), *C->ComponentName1.ComponentName.ToString(),
 				*C->ComponentName2.ComponentName.ToString());
 		}
+		// Arm drive audit: the LIVE per-constraint gains/limits, so a PIE
+		// session and a headless probe can be compared line-for-line (a
+		// stale placed instance or template drift shows up here as
+		// MaxForce=0 or wrong stiffness — the difference between an arm
+		// swing tipping the base or not).
+		if (C->GetName().StartsWith(TEXT("ChaosRig_arm_"))
+			&& !C->GetName().StartsWith(TEXT("ChaosRig_arm_2f85_")))
+		{
+			const FConstraintDrive& TD =
+				C->ConstraintInstance.ProfileInstance.AngularDrive.TwistDrive;
+			if (TD.bEnablePositionDrive)
+			{
+				UE_LOG(LogTemp, Display,
+					TEXT("[ApplyChaos] armdrive %s: k=%.0f d=%.0f maxTorque=%.0f"),
+					*C->GetName(), TD.Stiffness, TD.Damping, TD.MaxForce);
+			}
+		}
 		++NumInited;
 	}
 	if (NumInited < ChaosConstraintComponents.Num())
@@ -839,8 +872,14 @@ void URammsBackendSwitchComponent::SetJointCommand(FName Joint, float Value)
 	{
 		for (int32 Idx = 0; Idx < DriveJoints.Num(); ++Idx)
 		{
-			if (DriveJoints[Idx] == Joint
-				&& DriveIsLinear.IsValidIndex(Idx) && DriveIsLinear[Idx])
+			if (DriveJoints[Idx] != Joint)
+			{
+				continue;
+			}
+			const bool bLinear = DriveIsLinear.IsValidIndex(Idx) && DriveIsLinear[Idx];
+			const bool bAngularPosition = !bLinear
+				&& DriveIsPosition.IsValidIndex(Idx) && DriveIsPosition[Idx];
+			if (bLinear || bAngularPosition)
 			{
 				// Clamp to the published drive range = mechanism-realizable
 				// travel (the caster rods' MJCF ctrlrange overshoots what the
@@ -850,6 +889,15 @@ void URammsBackendSwitchComponent::SetJointCommand(FName Joint, float Value)
 				{
 					Value = FMath::Clamp(Value, DriveCtrlMin[Idx], DriveCtrlMax[Idx]);
 				}
+				// SLEW every position drive, angular included: dragging the
+				// arm_joint_2 panel slider back and forth commanded ~170 deg/s
+				// shoulder reversals — the kp 2e7 drive slammed the arm into
+				// its hard windows each cycle and pumped the 267 kg base 57 cm
+				// off the ground (measured with Ramms.JointSweep x4). The real
+				// Kinova joints are velocity-limited to ~50-57 deg/s; slewing
+				// the TARGET at 90 deg/s keeps drive tracking error (and
+				// therefore torque transients) bounded regardless of how the
+				// UI moves.
 				FVector2D& S = SlewTargets.FindOrAdd(Joint); // X: slewed cur (starts 0 = rest)
 				S.Y = Value;
 				if (!GetWorld()->GetTimerManager().IsTimerActive(SlewTimer))
@@ -876,9 +924,26 @@ void URammsBackendSwitchComponent::TickSlew()
 		{
 			continue;
 		}
-		// Rod targets are metres: 0.03 units/s = 3 cm/s, matching the
-		// quasistatic pace MuJoCo's strokes settle at.
-		const float Next = FMath::FInterpConstantTo(Cur, Cmd, 0.033f, 0.03f);
+		// Per-type target rate:
+		//  - linear rods (metres): 0.03 units/s = 3 cm/s, the quasistatic
+		//    pace MuJoCo's strokes settle at;
+		//  - angular position drives (radians): 1.6 rad/s (~90 deg/s),
+		//    bounding drive tracking error above the real Kinova joint
+		//    speed limits (50-57 deg/s) but far below the slider-slam
+		//    rates that pumped the base airborne.
+		float Rate = 0.03f;
+		for (int32 Idx = 0; Idx < DriveJoints.Num(); ++Idx)
+		{
+			if (DriveJoints[Idx] == Pair.Key)
+			{
+				if (!(DriveIsLinear.IsValidIndex(Idx) && DriveIsLinear[Idx]))
+				{
+					Rate = 1.6f;
+				}
+				break;
+			}
+		}
+		const float Next = FMath::FInterpConstantTo(Cur, Cmd, 0.033f, Rate);
 		Pair.Value.X = Next;
 		ApplyJointTarget(Pair.Key, Next);
 		bAnyMoving = true;
