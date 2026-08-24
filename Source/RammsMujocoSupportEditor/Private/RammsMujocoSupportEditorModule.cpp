@@ -198,27 +198,12 @@ namespace
 		return PM;
 	}
 
-	// Rubber DRIVE wheels: high friction, MAX combine (MJCF priority=1
-	// equivalent) — without it, straight driving slides laterally.
-	// OMNIWHEEL casters: the opposite! They are passive rollers whose contact
-	// patch must slip (MJCF friction 0.12); giving them grip converts any
-	// linkage motion into propulsion (observed: rod commands launched the
-	// robot and spun the casters).
-	static UPhysicalMaterial* GetDriveWheelPhysMaterial()
-	{
-		return GetOrCreatePhysMaterial(TEXT("PM_RammsWheel"), 1.2f, EFrictionCombineMode::Max);
-	}
-
-	static UPhysicalMaterial* GetCasterPhysMaterial()
-	{
-		// 0.12/Min let the omniwheels SKATE (user: wheels not rotating, or
-		// spinning against the travel direction) — Min-combine takes the
-		// lower of wheel/floor so they never grip enough to roll. Chaos has
-		// no anisotropic friction; approximate "grippy in roll, free
-		// sideways" with a moderate isotropic 0.35 / Average.
-		return GetOrCreatePhysMaterial(TEXT("PM_RammsCaster"), 0.35f, EFrictionCombineMode::Average);
-	}
-
+	// (Contact materials are synthesized from the MJCF geom friction/priority
+	// in AddCollisionFromGeoms below. The historical note that 0.12/Min made
+	// the omniwheel casters SKATE predates the caster anti-creep drive's
+	// 1 N*m torque cap — with the cap, rolling needs only ~μ 0.03 of grip.
+	// Validate caster rolling with Ramms.Probe's wheelW-vs-chassis-speed
+	// metric whenever these rules change.)
 	static bool AddCollisionFromGeoms(const FRigBody& Body, TSet<UPackage*>& OutModifiedPackages,
 		const TSet<UStaticMesh*>& BodyMeshes)
 	{
@@ -296,25 +281,46 @@ namespace
 		}
 		Setup->CollisionTraceFlag = CTF_UseDefault;
 		{
-			const FString BodyName = Body.VizNode->GetVariableName().ToString();
-			if (BodyName.Contains(TEXT("drive_wheel")))
+			// MJCF-DRIVEN contact materials (replaces the old name-based
+			// PM_RammsWheel/Caster/Chassis heuristics): the authored geom
+			// `friction` / `priority` are the single source of truth across
+			// MuJoCo, Newton, and Chaos. MuJoCo pair friction is the
+			// elementwise MAX of the two geoms unless one has higher
+			// `priority`, in which case that geom's value WINS — emulated
+			// here with the combine mode: priority geoms below the UE world
+			// default use Min (the authored low friction wins over the
+			// floor, e.g. the 0.12 omniwheel casters), everything else uses
+			// Max (an authored 1.0 wins over UE's default 0.7 floor, like
+			// MuJoCo's max rule against its friction-1.0 floor).
+			// LIMITATION: only geom-INLINE attributes are read; MJCF class
+			// defaults are not resolved onto the templates (the 2f85 pad
+			// boxes inherit their class friction and land on the 1.0/Max
+			// default here — grippier pads, acceptable for grasping).
+			float Mu = 1.0f;
+			int32 Priority = 0;
+			for (UMjGeom* Geom : Body.Geoms)
 			{
-				Setup->PhysMaterial = GetDriveWheelPhysMaterial();
+				if ((Geom->bOverride_contype && Geom->contype == 0)
+					|| Geom->Type == EMjGeomType::Mesh || Geom->Type == EMjGeomType::Plane)
+				{
+					continue; // same visual/mesh filter as the shape build above
+				}
+				if (Geom->bOverride_friction && Geom->friction.Num() > 0)
+				{
+					Mu = Geom->friction[0];
+				}
+				if (Geom->bOverride_priority)
+				{
+					Priority = FMath::Max(Priority, Geom->priority);
+				}
 			}
-			else if (BodyName.Contains(TEXT("caster_wheel")))
-			{
-				Setup->PhysMaterial = GetCasterPhysMaterial();
-			}
-			else if (BodyName.Contains(TEXT("mebot__mebot__chassis")))
-			{
-				// Belly-resting parked pose: the chassis floor IS a contact.
-				// With the drive wheels at 1.2/Max and the belly at default
-				// 0.7/Avg, an elevator stroke that swings the carriage back
-				// ROLLED the whole robot 90 cm (wheels gripped, belly slid);
-				// MuJoCo (belly friction 1) lifts the chassis 4 cm instead.
-				// Give the belly the same grip as the wheels.
-				Setup->PhysMaterial = GetOrCreatePhysMaterial(TEXT("PM_RammsChassis"), 1.0f, EFrictionCombineMode::Max);
-			}
+			const EFrictionCombineMode::Type Combine =
+				(Priority > 0 && Mu < 1.0f) ? EFrictionCombineMode::Min
+											: EFrictionCombineMode::Max;
+			const FString PMName = FString::Printf(TEXT("PM_Mj_f%03d_%s"),
+				FMath::RoundToInt(Mu * 1000.f),
+				Combine == EFrictionCombineMode::Min ? TEXT("Min") : TEXT("Max"));
+			Setup->PhysMaterial = GetOrCreatePhysMaterial(*PMName, Mu, Combine);
 		}
 		Setup->InvalidatePhysicsData();
 		Setup->CreatePhysicsMeshes();
@@ -1279,12 +1285,23 @@ namespace
 						// orientation-hold PD, or the arm free-falls and flails
 						// under Chaos (velocity damping alone holds nothing).
 						// N*m/rad -> kg*cm^2/s^2 per rad needs x1e4.
+						// TORQUE-CAPPED at the actuator's forcerange (Kinova
+						// large 105 N*m, small 52 N*m): unlimited, a stepped
+						// slider command at kp 2e7 dumps an arbitrarily large
+						// torque transient through the mast — the reaction can
+						// tip the whole 267 kg base (user: "moving the elbow
+						// makes the robot fall over"). MuJoCo saturates the
+						// same command at forcerange.
+						const float ArmMaxTorque = (Params->forcerange.Num() >= 2
+													   && FMath::Abs(Params->forcerange[1]) > KINDA_SMALL_NUMBER)
+							? FMath::Abs(Params->forcerange[1]) * 1e4f
+							: 1e6f;
 						CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
 						CI.SetOrientationDriveTwistAndSwing(true, false);
 						CI.SetAngularVelocityDriveTwistAndSwing(true, false);
 						CI.SetAngularDriveParams(
 							FMath::Clamp(Kp * 1e4f, 1e5f, 5e7f),
-							FMath::Clamp(Kv * 1e4f, 1e4f, 5e6f), 0.f);
+							FMath::Clamp(Kv * 1e4f, 1e4f, 5e6f), ArmMaxTorque);
 						Switch->DriveJoints.Add(*JointMjName);
 						Switch->DriveConstraints.Add(*CName);
 						Switch->DriveIsLinear.Add(false);
