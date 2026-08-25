@@ -931,6 +931,15 @@ namespace
 					// block.)
 					CI.SetAngularTwistLimit(ACM_Limited, FMath::Max(Half, 1.f));
 					CI.ProfileInstance.TwistLimit.bSoftConstraint = true;
+					// (1e7/1e6 was benched against the turn-induced suspension
+					// fold and changed NOTHING — identical -41 deg
+					// motor_elevator, identical chassis jack — so the windows
+					// are engaged and the fold is the mechanism's geometric
+					// response to sustained wheel reaction torque. Kept at the
+					// long-validated values; the turn anomaly is upstream: the
+					// commanded in-place turn TRANSLATES ~2 m instead of
+					// yawing, grinding the wheels at full torque into the
+					// suspension. Needs yaw instrumentation.)
 					CI.ProfileInstance.TwistLimit.Stiffness = 1e6f;
 					CI.ProfileInstance.TwistLimit.Damping = 1e5f;
 				}
