@@ -1,9 +1,8 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "RammsMjEndEffectorController.h"
-#include "MuJoCo/Components/Actuators/MjActuator.h"
 #include "MuJoCo/Core/MjArticulation.h"
-#include "MuJoCo/Components/Bodies/MjBody.h"
+#include "MuJoCo/Elements/MjBody.h"
 #include "GameFramework/Actor.h"
 
 namespace
@@ -86,7 +85,7 @@ void URammsMjEndEffectorController::TickComponent(float DeltaTime, ELevelTick Ti
 	bGoalValid = true;
 }
 
-void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActuator*>& ActuatorIdMap)
+void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjNodeComponent*>& ActuatorIdMap)
 {
 	Super::Bind(m, d, ActuatorIdMap);
 

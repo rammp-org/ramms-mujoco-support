@@ -4,7 +4,7 @@
 #include "Components/PoseableMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "MuJoCo/Core/MjArticulation.h"
-#include "MuJoCo/Components/Bodies/MjBody.h"
+#include "MuJoCo/Elements/MjBody.h"
 #include "GameFramework/Actor.h"
 #include "EngineUtils.h"
 
@@ -77,7 +77,10 @@ void URammsMjSkeletalPoseDriver::BuildMapping()
 		if (!Body)
 			continue;
 
-		const FString MjName = Body->GetMjName();
+		// v0.6.0-beta: the authored name is a presence-wrapped TOptional on UMjNodeComponent.
+		const FString MjName = Body->MjName.Get(FString());
+		if (MjName.IsEmpty())
+			continue;
 
 		// Resolve the target bone: explicit override first, else name match (after prefix strip).
 		FName Bone = NAME_None;
