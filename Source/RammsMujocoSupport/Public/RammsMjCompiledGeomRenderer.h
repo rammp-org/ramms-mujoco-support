@@ -67,8 +67,16 @@ private:
 	UMaterialInstanceDynamic* MaterialFor(const FLinearColor& Color);
 	UStaticMesh* BasicShape(const TCHAR* Path);
 
-	/** The model the current visuals were built from; a different pointer means a recompile. */
+	/** The model the current visuals were built from. A recompile is detected when this pointer
+	 *  changes OR the fingerprint below does — the fingerprint guards the case where a recompile
+	 *  frees the old model and the allocator hands back the same address (pointer alone would then
+	 *  miss the change and keep stale visuals). */
 	const void* BuiltForModel = nullptr;
+
+	/** Cheap compiled-model fingerprint (ngeom, nmesh, nq) captured at the last rebuild. */
+	int32 BuiltNGeom = -1;
+	int32 BuiltNMesh = -1;
+	int32 BuiltNQ = -1;
 
 	/** One entry per drawn geom: its MuJoCo geom id and the frame component that follows it. */
 	struct FGeomVisual

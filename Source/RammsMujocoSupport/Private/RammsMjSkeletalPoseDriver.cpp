@@ -78,7 +78,11 @@ void URammsMjSkeletalPoseDriver::BuildMapping()
 			continue;
 
 		// v0.6.0-beta: the authored name is a presence-wrapped TOptional on UMjNodeComponent.
-		const FString MjName = Body->MjName.Get(FString());
+		// Copy by value from GetValue() rather than Get(FString()): the latter returns a
+		// reference that would bind to the temporary default when unset.
+		if (!Body->MjName.IsSet())
+			continue;
+		const FString MjName = Body->MjName.GetValue();
 		if (MjName.IsEmpty())
 			continue;
 

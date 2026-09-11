@@ -61,6 +61,7 @@ void URammsMjCompiledGeomRenderer::ClearVisuals()
 	Visuals.Reset();
 	MaterialCache.Reset();
 	BuiltForModel = nullptr;
+	BuiltNGeom = BuiltNMesh = BuiltNQ = -1;
 }
 
 void URammsMjCompiledGeomRenderer::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -82,7 +83,9 @@ void URammsMjCompiledGeomRenderer::TickComponent(float DeltaTime, ELevelTick Tic
 		}
 		return;
 	}
-	if (Model != BuiltForModel)
+	// Rebuild on a new model pointer, or on a fingerprint change at the same address (an in-place
+	// recompile can reuse the freed model's address, which the pointer alone would miss).
+	if (Model != BuiltForModel || Model->ngeom != BuiltNGeom || Model->nmesh != BuiltNMesh || Model->nq != BuiltNQ)
 	{
 		Rebuild(*Engine);
 	}
@@ -123,6 +126,9 @@ void URammsMjCompiledGeomRenderer::Rebuild(UMjPhysicsEngine& Engine)
 		return;
 	}
 	BuiltForModel = Model;
+	BuiltNGeom = Model->ngeom;
+	BuiltNMesh = Model->nmesh;
+	BuiltNQ = Model->nq;
 
 	// Component-bound geoms are already drawn by URLab; collect the articulations once and ask
 	// each per geom id. (Ids are scene-global after composition, so any articulation may own one.)
@@ -209,8 +215,10 @@ USceneComponent* URammsMjCompiledGeomRenderer::MakeFrame(int32 GeomId)
 	{
 		return nullptr;
 	}
-	USceneComponent* Frame = NewObject<USceneComponent>(Owner,
-		*FString::Printf(TEXT("MjCompiledGeom_%d"), GeomId));
+	// Auto-generated name (not "MjCompiledGeom_<id>"): a rebuild destroys the old frames but they
+	// are not GC'd immediately, so reusing a deterministic name would collide with the pending-kill
+	// object and force a rename (warning, and an assert on some paths).
+	USceneComponent* Frame = NewObject<USceneComponent>(Owner);
 	// World transforms come straight from the physics snapshot; the owner's own motion is noise.
 	Frame->SetUsingAbsoluteLocation(true);
 	Frame->SetUsingAbsoluteRotation(true);
