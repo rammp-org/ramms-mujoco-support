@@ -1,9 +1,8 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "RammsMjEndEffectorController.h"
-#include "MuJoCo/Components/Actuators/MjActuator.h"
 #include "MuJoCo/Core/MjArticulation.h"
-#include "MuJoCo/Components/Bodies/MjBody.h"
+#include "MuJoCo/Elements/MjBody.h"
 #include "GameFramework/Actor.h"
 
 namespace
@@ -86,7 +85,7 @@ void URammsMjEndEffectorController::TickComponent(float DeltaTime, ELevelTick Ti
 	bGoalValid = true;
 }
 
-void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActuator*>& ActuatorIdMap)
+void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjNodeComponent*>& ActuatorIdMap)
 {
 	Super::Bind(m, d, ActuatorIdMap);
 
@@ -95,12 +94,25 @@ void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32
 	ArmDofAddr.Reset();
 	GripActId = -1;
 
+	// URLab's scene assembly prefixes every compiled name with the owning articulation actor's
+	// ("{ActorName}_..."), so this controller's elements must be matched within its own prefix.
+	// Match on StartsWith(owner prefix) AND EndsWith(authored suffix): unambiguous across multiple
+	// arms in one composed model, and — unlike concatenating the two — robust to the intermediate
+	// prefixes composition adds (e.g. the gripper's "2f85_" in "{ActorName}_2f85_fingers_actuator").
+	// An empty suffix matches nothing rather than binding the first element of its kind.
+	const FString OwnerPrefix = GetOwner() != nullptr ? GetOwner()->GetName() + TEXT("_") : FString();
+	const auto MatchesInOwner = [&OwnerPrefix](const char* Name, const FString& Suffix) -> bool {
+		if (Name == nullptr || Suffix.IsEmpty())
+			return false;
+		const FString N = ANSI_TO_TCHAR(Name);
+		return N.StartsWith(OwnerPrefix) && N.EndsWith(Suffix);
+	};
+
 	// Find the gripper actuator by name over ALL model actuators. It drives a tendon (not a
 	// joint), so the base class may omit it from Bindings — a name lookup is robust either way.
 	for (int a = 0; a < m->nu; ++a)
 	{
-		const char* nm = mj_id2name(m, mjOBJ_ACTUATOR, a);
-		if (nm && FString(ANSI_TO_TCHAR(nm)).EndsWith(GripperActuatorSuffix))
+		if (MatchesInOwner(mj_id2name(m, mjOBJ_ACTUATOR, a), GripperActuatorSuffix))
 		{
 			GripActId = a;
 			float Lo = (float)m->actuator_ctrlrange[a * 2];
@@ -122,12 +134,11 @@ void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32
 		ArmDofAddr.Add(B.QvelAddr);
 	}
 
-	// Resolve the EE site by suffix against the (prefixed) compiled names.
+	// Resolve the EE site within this arm's prefix against the compiled names.
 	EeSiteId = -1;
 	for (int s = 0; s < m->nsite; ++s)
 	{
-		const char* nm = mj_id2name(m, mjOBJ_SITE, s);
-		if (nm && FString(ANSI_TO_TCHAR(nm)).EndsWith(EndEffectorSiteName))
+		if (MatchesInOwner(mj_id2name(m, mjOBJ_SITE, s), EndEffectorSiteName))
 		{
 			EeSiteId = s;
 			break;
@@ -165,8 +176,17 @@ void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32
 			}
 		}
 	}
-	if (!BaseTargetBodyName.IsEmpty())
-		BaseTargetBodyId = mj_name2id(m, mjOBJ_BODY, TCHAR_TO_ANSI(*BaseTargetBodyName));
+	// Prefixed match like the site/actuator lookups (an exact mj_name2id on the authored name
+	// finds nothing under composition's "{ActorName}_base_target"). Owner-scoped so a scene with
+	// more than one arm seats each free base on its own mount, not the lowest-id one.
+	for (int b = 0; b < m->nbody; ++b)
+	{
+		if (MatchesInOwner(mj_id2name(m, mjOBJ_BODY, b), BaseTargetBodyName))
+		{
+			BaseTargetBodyId = b;
+			break;
+		}
+	}
 	if (FreeBaseQposAddr >= 0 && BaseTargetBodyId >= 0)
 		BaseInitStepsLeft = BaseInitSteps;
 

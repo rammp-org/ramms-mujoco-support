@@ -22,6 +22,9 @@ public class RammsMujocoSupport : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
+			// Runtime-built meshes for the compiled-geom renderer (visuals for
+			// <attach>/<model>-spliced content that has no URLab components).
+			"ProceduralMeshComponent",
 		});
 	}
 }

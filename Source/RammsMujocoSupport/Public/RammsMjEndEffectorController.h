@@ -3,10 +3,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "MuJoCo/Components/Controllers/MjArticulationController.h"
+#include "MuJoCo/Controllers/MjArticulationController.h"
 #include "RammsMjEndEffectorController.generated.h"
 
-class UMjActuator;
+class UMjNodeComponent;
 
 /**
  * End-effector IK controller for a URLab MuJoCo articulation (e.g. the Kinova Gen3 + 2F-85).
@@ -114,7 +114,7 @@ public:
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 	// --- UMjArticulationController interface ---
-	virtual void Bind(mjModel* m, mjData* d, const TMap<int32, UMjActuator*>& ActuatorIdMap) override;
+	virtual void Bind(mjModel* m, mjData* d, const TMap<int32, UMjNodeComponent*>& ActuatorIdMap) override;
 	virtual void ComputeAndApply(mjModel* m, mjData* d, uint8 Source) override;
 	virtual FString GetKindName() const override { return TEXT("ee_ik"); }
 
