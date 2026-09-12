@@ -2,40 +2,50 @@
 
 #include "RammsMujocoActuationBackend.h"
 #include "RammsRobotBaseComponent.h"
+#include "MuJoCo/Core/AMjManager.h"
 #include "MuJoCo/Core/MjArticulation.h"
+#include "MuJoCo/Core/MjPhysicsEngine.h"
 #include "MuJoCo/Elements/MjActuatorRuntime.h"
+#include "MuJoCo/Elements/MjBody.h"
 #include "MuJoCo/Spec/MjNodeComponent.h"
 #include "GameFramework/Actor.h"
-#include "EngineUtils.h"
+#include "mujoco/mujoco.h"
 
 bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
 {
 	Articulation = nullptr;
 	ActuatorByMotor.Reset();
 
-	// Resolve the articulation: the owner itself, else the first one in the
-	// world (mirrors the skeletal-pose driver / drive backend).
-	if (AActor* Owner = Base.GetOwner())
+	// Resolve the articulation: the owner itself, else one attached under it
+	// (a composed robot whose base component lives on a parent actor). Never
+	// an arbitrary articulation elsewhere in the level — with Backend=Auto that
+	// would silently hijack an unrelated robot's actuators (and its control
+	// source) while leaving this one undriven.
+	AActor* Owner = Base.GetOwner();
+	if (!Owner)
 	{
-		if (AMjArticulation* AsArt = Cast<AMjArticulation>(Owner))
-		{
-			Articulation = AsArt;
-		}
+		return false;
 	}
-	if (!Articulation.IsValid())
+	if (AMjArticulation* AsArt = Cast<AMjArticulation>(Owner))
 	{
-		if (UWorld* World = Base.GetWorld())
+		Articulation = AsArt;
+	}
+	else
+	{
+		TArray<AActor*> Children;
+		Owner->GetAttachedActors(Children, /*bResetArray=*/true, /*bRecursivelyIncludeAttachedActors=*/true);
+		for (AActor* Child : Children)
 		{
-			for (TActorIterator<AMjArticulation> It(World); It; ++It)
+			if (AMjArticulation* ChildArt = Cast<AMjArticulation>(Child))
 			{
-				Articulation = *It;
+				Articulation = ChildArt;
 				break;
 			}
 		}
 	}
 	if (!Articulation.IsValid())
 	{
-		return false; // no MuJoCo articulation — base component stays backend-less
+		return false; // no MuJoCo articulation on this robot — base component falls back
 	}
 
 	// UE owns the drive: select the internal (UI/Blueprint) control slot so
@@ -101,9 +111,38 @@ bool FRammsMujocoActuationBackend::GetMotorTransform(FName MotorId, FTransform& 
 	{
 		return false;
 	}
-	// UMjNodeComponent is a USceneComponent placed at the actuator's element in
-	// the articulation hierarchy — good enough for derived geometry like
-	// drive-motor separation (skid-steer track width).
+
+	// <actuator> elements live at the model root, not on the body they drive,
+	// so the actuator node's own transform says nothing about where the motor
+	// is. Resolve the transmission target instead: actuator -> joint -> body,
+	// and report that body's world transform (the wheel, for a drive motor).
+	AMjArticulation*		Art = Articulation.Get();
+	const TOptional<int32>& BoundId = Actuator->GetBoundId();
+	if (Art && BoundId.IsSet() && BoundId.GetValue() >= 0)
+	{
+		if (const UMjPhysicsEngine* Engine = AAMjManager::ResolveEngine(Actuator))
+		{
+			if (const mjModel* Model = Engine->GetModel())
+			{
+				const int32 ActId = BoundId.GetValue();
+				if (ActId < Model->nu && Model->actuator_trntype[ActId] == mjTRN_JOINT)
+				{
+					const int32 JointId = Model->actuator_trnid[2 * ActId];
+					if (JointId >= 0 && JointId < Model->njnt)
+					{
+						if (UMjBody* Body = Art->GetBodyByMjId(Model->jnt_bodyid[JointId]))
+						{
+							OutWorld = Body->GetComponentTransform();
+							return true;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Not a joint transmission (tendon/site/body) or not yet compiled: the
+	// element node's transform is the best available.
 	OutWorld = Actuator->GetComponentTransform();
 	return true;
 }

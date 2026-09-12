@@ -23,7 +23,14 @@ class UMjNodeComponent;
  * It clamps to the compiled actuator's ctrlrange (the base component may also
  * clamp to the registry ControlRange first), selects the UI control source so
  * game-thread writes reach d->ctrl, and resolves actuator nodes once, lazily,
- * caching the UMjNodeComponent* per Id.
+ * caching the UMjNodeComponent* per Id. GetMotorTransform reports the body the
+ * actuator's joint transmission drives (the wheel for a drive motor), since
+ * <actuator> elements themselves sit at the model root.
+ *
+ * Only an articulation that IS the owner actor, or is attached under it, is
+ * driven — never one found elsewhere in the level — because Initialize also
+ * switches that articulation's ControlSource to the UI slot (taking it away
+ * from the ZMQ bridge), which must not happen to an unrelated robot.
  */
 class FRammsMujocoActuationBackend final : public IRammsActuationBackend
 {
