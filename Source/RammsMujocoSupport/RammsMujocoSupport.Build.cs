@@ -18,6 +18,9 @@ public class RammsMujocoSupport : ModuleRules
 			// libs publicly, so depending on it gives us the MuJoCo C API + the
 			// UMjArticulationController base class.
 			"URLab",
+			// The robot base component + IRammsActuationBackend interface and the
+			// cross-plugin actuation-backend registry we register into at startup.
+			"RammsCore",
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]
