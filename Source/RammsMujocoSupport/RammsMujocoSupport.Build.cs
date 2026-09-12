@@ -18,6 +18,10 @@ public class RammsMujocoSupport : ModuleRules
 			// libs publicly, so depending on it gives us the MuJoCo C API + the
 			// UMjArticulationController base class.
 			"URLab",
+			// The drive-backend interface + registry live in RammsCore; our
+			// FRammsMujocoDriveBackend implements the former and registers with
+			// the latter so RammsCore need not depend on URLab.
+			"RammsCore",
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]
