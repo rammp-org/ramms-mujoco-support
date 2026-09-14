@@ -21,6 +21,10 @@
 		{
 			"Name": "UnrealRoboticsLab",
 			"Enabled": true
+		},
+		{
+			"Name": "RammsCore",
+			"Enabled": true
 		}
 	]
 }
