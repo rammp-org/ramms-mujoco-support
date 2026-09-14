@@ -192,6 +192,45 @@ float FRammsMujocoActuationBackend::GetVelocity(FName MotorId) const
 	return Trn->bSlide ? Vel * 100.0f : Vel;
 }
 
+bool FRammsMujocoActuationBackend::ReleaseMotor(FName MotorId)
+{
+	// A MuJoCo actuator has no off switch: its ctrl is applied every step. The
+	// closest thing to "let go" is to park it — a position servo at the joint's
+	// current position (so it stops pursuing its old target and holds where it
+	// is), a motor / velocity actuator at zero.
+	UMjNodeComponent* Actuator = ResolveActuator(MotorId);
+	if (!Actuator)
+	{
+		return false;
+	}
+	float Park = 0.0f;
+	if (const FTransmission* Trn = ResolveTransmission(MotorId))
+	{
+		const mjModel* Model = nullptr;
+		if (const UMjPhysicsEngine* Engine = AAMjManager::ResolveEngine(Actuator))
+		{
+			Model = Engine->GetModel();
+		}
+		const TOptional<int32>& BoundId = Actuator->GetBoundId();
+		// <position> actuators have a position gain and a matching negative bias
+		// (biasprm[1] = -kp); anything else is treated as force-like -> 0.
+		const bool bPositionServo = Model && BoundId.IsSet() && BoundId.GetValue() >= 0 && BoundId.GetValue() < Model->nu
+			&& Model->actuator_biastype[BoundId.GetValue()] == mjBIAS_AFFINE
+			&& Model->actuator_biasprm[BoundId.GetValue() * mjNBIAS + 1] < 0.0;
+		if (bPositionServo)
+		{
+			Park = UMjJointRuntime::GetPosition(Trn->Joint.Get()); // joint units (rad / m), as ctrl expects
+		}
+	}
+	const FVector2D Range = UMjActuatorRuntime::GetControlRange(Actuator);
+	if (Range.X < Range.Y)
+	{
+		Park = FMath::Clamp(Park, static_cast<float>(Range.X), static_cast<float>(Range.Y));
+	}
+	UMjActuatorRuntime::SetControl(Actuator, Park);
+	return true;
+}
+
 bool FRammsMujocoActuationBackend::GetMotorTransform(FName MotorId, FTransform& OutWorld) const
 {
 	// <actuator> elements live at the model root, so the actuator node's own
