@@ -200,6 +200,12 @@ void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32
 		FScopeLock Lock(&BaseGoalMutex);
 		bGoalValid = false;
 	}
+	// A simulation reset restores mjData but not this controller's target and
+	// grip, which URLab would re-apply straight away: re-seed on reset.
+	if (AMjArticulation* Art = Cast<AMjArticulation>(GetOwner()))
+	{
+		Art->OnSimulationReset.AddUniqueDynamic(this, &URammsMjEndEffectorController::HandleSimulationReset);
+	}
 	if (bSmoothBaseTarget && BaseTargetMocapId >= 0)
 	{
 		if (AMjArticulation* Art = Cast<AMjArticulation>(GetOwner()))
@@ -517,4 +523,20 @@ bool URammsMjEndEffectorController::IsTargetInitialized() const
 {
 	FScopeLock Lock(&TargetMutex);
 	return bTargetInit;
+}
+
+void URammsMjEndEffectorController::HandleSimulationReset()
+{
+	// Forget the commanded target and grip: the next physics step re-seeds the
+	// target from the reset end-effector pose, and the gripper opens.
+	{
+		FScopeLock Lock(&TargetMutex);
+		bTargetInit = false;
+	}
+	{
+		FScopeLock Lock(&BaseGoalMutex);
+		bGoalValid = false;
+	}
+	bSmoothInit = false;
+	GripCtrl = 0.0;
 }

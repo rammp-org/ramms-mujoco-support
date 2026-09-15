@@ -2,6 +2,7 @@
 
 #include "RammsMjArmTeleopComponent.h"
 #include "RammsMjEndEffectorController.h"
+#include "MuJoCo/Core/MjArticulation.h"
 #include "GameFramework/PlayerController.h"
 
 URammsMjArmTeleopComponent::URammsMjArmTeleopComponent()
@@ -14,6 +15,19 @@ void URammsMjArmTeleopComponent::BeginPlay()
 {
 	Super::BeginPlay();
 	ResolveController();
+	if (AMjArticulation* Art = Cast<AMjArticulation>(GetOwner()))
+	{
+		Art->OnSimulationReset.AddUniqueDynamic(this, &URammsMjArmTeleopComponent::HandleSimulationReset);
+	}
+}
+
+void URammsMjArmTeleopComponent::HandleSimulationReset()
+{
+	// The controller re-seeds its target and opens the gripper on reset; drop
+	// the cached rates and grip state here so they don't resume it.
+	ControlLinear = FVector::ZeroVector;
+	ControlAngular = FRotator::ZeroRotator;
+	bGripClosed = false;
 }
 
 URammsMjEndEffectorController* URammsMjArmTeleopComponent::ResolveController()

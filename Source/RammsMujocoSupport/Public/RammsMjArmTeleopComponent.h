@@ -167,6 +167,9 @@ public:
 private:
 	URammsMjEndEffectorController* ResolveController();
 
+	UFUNCTION()
+	void HandleSimulationReset();
+
 	/** Rate input from the control surface, applied in TickComponent. */
 	FVector	 ControlLinear = FVector::ZeroVector;  // X forward, Y strafe, Z up
 	FRotator ControlAngular = FRotator::ZeroRotator; // Yaw / Pitch / Roll
