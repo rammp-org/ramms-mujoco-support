@@ -66,6 +66,9 @@ public:
 	virtual APawn* SpawnDefaultPawnAtTransform_Implementation(AController* NewPlayer, const FTransform& SpawnTransform) override;
 	virtual void   StartPlay() override;
 
+	/** Stop URLab's UMjInputHandler ticking (its hotkeys collide with robot keys). */
+	void DisableUrlabHotkeys(AAMjManager* Manager);
+
 private:
 	void TryStartSimulation();
 
