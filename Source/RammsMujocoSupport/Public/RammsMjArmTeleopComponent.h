@@ -42,9 +42,14 @@ protected:
 public:
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
-	/** Master enable. */
+	/** Master enable (control-surface and key paths). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MjTeleop")
 	bool bTeleopEnabled = true;
+
+	/** Legacy: poll the keys / mouse below each tick. Off by default — the
+	 *  Enhanced Input map drives arm.* / gripper.* through the control surface. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MjTeleop")
+	bool bEnableKeyPolling = false;
 
 	/** Optional controller component name if the actor has more than one. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MjTeleop")

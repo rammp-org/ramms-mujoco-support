@@ -50,6 +50,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MuJoCo")
 	bool bHideSimulateWidget = true;
 
+	/** Disable URLab's UMjInputHandler hotkeys (R reset, P pause, 1-7 debug,
+	 *  O cameras...) and its simulate widget's Tab input-mode toggle: they
+	 *  collide with robot controls. Their functions stay reachable as sim.*
+	 *  controls (URammsMjSimControlComponent) through the control surface. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MuJoCo")
+	bool bDisableUrlabHotkeys = true;
+
 	/** Spawn DefaultPawnClass in InitGame (before the scene compiles) rather
 	 *  than at player login, so the pawn is part of the MuJoCo scene. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MuJoCo")

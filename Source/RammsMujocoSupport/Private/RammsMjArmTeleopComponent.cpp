@@ -62,6 +62,10 @@ void URammsMjArmTeleopComponent::TickComponent(float DeltaTime, ELevelTick TickT
 	{
 		ApplyTeleopInput(ControlLinear, ControlAngular, DeltaTime, 1.0f);
 	}
+	if (!bEnableKeyPolling)
+	{
+		return;
+	}
 
 	UWorld* World = GetWorld();
 	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;

@@ -2,6 +2,7 @@
 
 #include "RammsMujocoTestGameMode.h"
 #include "MuJoCo/Core/AMjManager.h"
+#include "MuJoCo/Input/MjInputHandler.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
@@ -59,6 +60,15 @@ APawn* ARammsMujocoTestGameMode::SpawnDefaultPawnAtTransform_Implementation(ACon
 
 void ARammsMujocoTestGameMode::StartPlay()
 {
+	// Before Super (which runs every actor's BeginPlay): keep the manager from
+	// creating its simulate widget, whose NativeTick owns Tab.
+	if (bDisableUrlabHotkeys)
+	{
+		if (AAMjManager* Manager = Cast<AAMjManager>(UGameplayStatics::GetActorOfClass(GetWorld(), AAMjManager::StaticClass())))
+		{
+			Manager->bAutoCreateSimulateWidget = false;
+		}
+	}
 	Super::StartPlay();
 
 	if (bStartSimulationOnBeginPlay)
@@ -75,6 +85,13 @@ void ARammsMujocoTestGameMode::TryStartSimulation()
 	AAMjManager* Manager = Cast<AAMjManager>(UGameplayStatics::GetActorOfClass(GetWorld(), AAMjManager::StaticClass()));
 	if (Manager)
 	{
+		if (bDisableUrlabHotkeys && Manager->InputHandler && Manager->InputHandler->IsComponentTickEnabled())
+		{
+			// R / P / O / 1-7 / F... are robot keys here; sim.* controls on the
+			// robot's control surface carry the functions that matter.
+			Manager->InputHandler->SetComponentTickEnabled(false);
+			UE_LOG(LogTemp, Log, TEXT("[MujocoTestGameMode] URLab UMjInputHandler hotkeys disabled (sim.* controls take over)."));
+		}
 		if (!Manager->IsRunning())
 		{
 			Manager->SetPaused(false);
