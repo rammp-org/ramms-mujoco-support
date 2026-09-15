@@ -203,8 +203,8 @@ void URammsMjArmTeleopComponent::DescribeControls(FRammsControlSurface& OutSurfa
 	Rate(ArmForward, TEXT("Forward"), ArmStrafe, 0);
 	Rate(ArmStrafe, TEXT("Strafe"), ArmForward, 1);
 	Rate(ArmUp, TEXT("Up"), NAME_None, 2);
-	Rate(ArmYaw, TEXT("Yaw"), ArmPitch, 3);
-	Rate(ArmPitch, TEXT("Pitch"), ArmYaw, 4);
+	Rate(ArmPitch, TEXT("Pitch"), ArmYaw, 3); // paired: lower Order = the joystick's vertical axis
+	Rate(ArmYaw, TEXT("Yaw"), ArmPitch, 4);
 	Rate(ArmRoll, TEXT("Roll"), NAME_None, 5);
 
 	auto Action = [&OutSurface](FName Id, FName Group, const TCHAR* Name, int32 Order) {
