@@ -199,11 +199,11 @@ bool FRammsMujocoActuationBackend::ReleaseMotor(FName MotorId)
 	// the joint — and reporting false whenever that isn't possible, so the
 	// caller keeps treating the motor as driven:
 	//  - <motor> (force, no bias):   ctrl 0 = zero force              -> released
-	//  - <position> (bias kp < 0):   ctrl = current actuator length   -> parked
+	//  - <position> (bias kp < 0, no dynamics): ctrl = current actuator length -> parked
 	//    where it is (holds; stops pursuing its old target). Read as the
 	//    actuator LENGTH — gear- and transmission-aware — not the joint qpos.
 	//  - <velocity> (bias kv only):  ctrl 0 would BRAKE the joint     -> false
-	//  - anything else (intvelocity, general dynamics):               -> false
+	//  - anything with actuator dynamics (intvelocity, general):      -> false
 	UMjNodeComponent* Actuator = ResolveActuator(MotorId);
 	if (!Actuator)
 	{
@@ -219,9 +219,13 @@ bool FRammsMujocoActuationBackend::ReleaseMotor(FName MotorId)
 	const int32	  ActId = BoundId.GetValue();
 	const mjtNum* Bias = &Model->actuator_biasprm[ActId * mjNBIAS];
 	const bool	  bAffine = Model->actuator_biastype[ActId] == mjBIAS_AFFINE;
-	const bool	  bPositionServo = bAffine && Bias[1] < 0.0;
-	const bool	  bPlainForce = Model->actuator_biastype[ActId] == mjBIAS_NONE && Model->actuator_dyntype[ActId] == mjDYN_NONE;
-	float		  Park = 0.0f;
+	// Stateless dynamics only: <intvelocity> also compiles with an affine
+	// negative length bias, but its ctrl feeds an integrator — writing the
+	// current length there would drive it, not park it.
+	const bool bStateless = Model->actuator_dyntype[ActId] == mjDYN_NONE;
+	const bool bPositionServo = bStateless && bAffine && Bias[1] < 0.0;
+	const bool bPlainForce = Model->actuator_biastype[ActId] == mjBIAS_NONE && Model->actuator_dyntype[ActId] == mjDYN_NONE;
+	float	   Park = 0.0f;
 	if (bPositionServo)
 	{
 		Park = UMjActuatorRuntime::GetLength(Actuator);
