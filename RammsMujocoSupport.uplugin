@@ -25,6 +25,10 @@
 		{
 			"Name": "RammsCore",
 			"Enabled": true
+		},
+		{
+			"Name": "RammsUI",
+			"Enabled": true
 		}
 	]
 }

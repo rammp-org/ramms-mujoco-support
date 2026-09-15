@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "InputCoreTypes.h"
+#include "RammsControlContributor.h"
 #include "RammsMjArmTeleopComponent.generated.h"
 
 class URammsMjEndEffectorController;
@@ -20,9 +21,15 @@ class URammsMjEndEffectorController;
  * WASD so they don't clash with base driving:
  *   I/K = forward/back, J/L = strafe left/right, U/O = up/down, M/. = roll, arrows = yaw/pitch;
  *   right-mouse drag = yaw/pitch; [ / ] = open/close gripper, G = toggle, R = re-sync target to EE.
+ *
+ * It is also the arm's control-surface contributor, with the same ids as the
+ * Chaos arm's URammsEndEffectorTeleopComponent: rate axes arm.forward /
+ * arm.strafe / arm.up / arm.yaw / arm.pitch / arm.roll (normalized, integrated
+ * per tick at LinearSpeed / AngularSpeed), arm.resync, gripper.open /
+ * gripper.close / gripper.toggle and the gripper.closed readback.
  */
 UCLASS(ClassGroup = (Ramms), meta = (BlueprintSpawnableComponent))
-class RAMMSMUJOCOSUPPORT_API URammsMjArmTeleopComponent : public UActorComponent
+class RAMMSMUJOCOSUPPORT_API URammsMjArmTeleopComponent : public UActorComponent, public IRammsControlContributor
 {
 	GENERATED_BODY()
 
@@ -138,8 +145,26 @@ public:
 	UFUNCTION(BlueprintPure, Category = "MjTeleop")
 	URammsMjEndEffectorController* GetController() const { return Controller; }
 
+	/** Nudge the target by normalized semantic rates (forward / strafe / up,
+	 *  yaw / pitch / roll, each -1..1) for DeltaTime at Scale x the teleop
+	 *  speeds — the mapping the key polling and the control surface share. */
+	UFUNCTION(BlueprintCallable, Category = "MjTeleop")
+	void ApplyTeleopInput(FVector LinearFSU, FRotator AngularYPR, float DeltaTime, float Scale = 1.0f);
+
+	// --- IRammsControlContributor: "arm.*", "gripper.*" ------------------------
+	virtual void  DescribeControls(FRammsControlSurface& OutSurface) const override;
+	virtual bool  ApplyControl(FName Id, float Value) override;
+	virtual bool  TriggerControl(FName Id) override;
+	virtual bool  ReleaseControl(FName Id) override;
+	virtual bool  ReadControl(FName Id, float& OutValue) const override;
+	virtual int32 GetControlOrder() const override { return 30; }
+
 private:
 	URammsMjEndEffectorController* ResolveController();
+
+	/** Rate input from the control surface, applied in TickComponent. */
+	FVector	 ControlLinear = FVector::ZeroVector;  // X forward, Y strafe, Z up
+	FRotator ControlAngular = FRotator::ZeroRotator; // Yaw / Pitch / Roll
 
 	UPROPERTY(Transient)
 	URammsMjEndEffectorController* Controller = nullptr;
