@@ -192,6 +192,68 @@ float FRammsMujocoActuationBackend::GetVelocity(FName MotorId) const
 	return Trn->bSlide ? Vel * 100.0f : Vel;
 }
 
+bool FRammsMujocoActuationBackend::ReleaseMotor(FName MotorId)
+{
+	// A MuJoCo actuator has no off switch: its ctrl is applied every step. So
+	// "release" means staging a ctrl under which the actuator stops acting on
+	// the joint — and reporting false whenever that isn't possible, so the
+	// caller keeps treating the motor as driven:
+	//  - <motor> (force, no bias):   ctrl 0 = zero force              -> released
+	//  - <position> (bias kp < 0, no dynamics): ctrl = current actuator length -> parked
+	//    where it is (holds; stops pursuing its old target). Read as the
+	//    actuator LENGTH — gear- and transmission-aware — not the joint qpos.
+	//  - <velocity> (bias kv only):  ctrl 0 would BRAKE the joint     -> false
+	//  - anything with actuator dynamics (intvelocity, general):      -> false
+	UMjNodeComponent* Actuator = ResolveActuator(MotorId);
+	if (!Actuator)
+	{
+		return false;
+	}
+	const UMjPhysicsEngine* Engine = AAMjManager::ResolveEngine(Actuator);
+	const mjModel*			Model = Engine ? Engine->GetModel() : nullptr;
+	const TOptional<int32>& BoundId = Actuator->GetBoundId();
+	if (!Model || !BoundId.IsSet() || BoundId.GetValue() < 0 || BoundId.GetValue() >= Model->nu)
+	{
+		return false; // not compiled / not bound: nothing can be staged
+	}
+	const int32	  ActId = BoundId.GetValue();
+	const mjtNum* Bias = &Model->actuator_biasprm[ActId * mjNBIAS];
+	const bool	  bAffine = Model->actuator_biastype[ActId] == mjBIAS_AFFINE;
+	// Stateless dynamics only: <intvelocity> also compiles with an affine
+	// negative length bias, but its ctrl feeds an integrator — writing the
+	// current length there would drive it, not park it.
+	const bool bStateless = Model->actuator_dyntype[ActId] == mjDYN_NONE;
+	const bool bPositionServo = bStateless && bAffine && Bias[1] < 0.0;
+	const bool bPlainForce = Model->actuator_biastype[ActId] == mjBIAS_NONE && Model->actuator_dyntype[ActId] == mjDYN_NONE;
+	float	   Park = 0.0f;
+	if (bPositionServo)
+	{
+		Park = UMjActuatorRuntime::GetLength(Actuator);
+	}
+	else if (!bPlainForce)
+	{
+		if (!WarnedUnsupported.Contains(MotorId))
+		{
+			WarnedUnsupported.Add(MotorId);
+			UE_LOG(LogTemp, Warning,
+				TEXT("RammsMujocoActuationBackend: actuator '%s' cannot be released (a velocity servo / dynamic actuator keeps acting at ctrl 0); it stays driven."),
+				*MotorId.ToString());
+		}
+		return false;
+	}
+	// A park value the compiled ctrlrange doesn't admit would be clamped into a
+	// command that still moves the joint: that is not a release.
+	const FVector2D Range = UMjActuatorRuntime::GetControlRange(Actuator);
+	if (Range.X < Range.Y && (Park < Range.X - KINDA_SMALL_NUMBER || Park > Range.Y + KINDA_SMALL_NUMBER))
+	{
+		return false;
+	}
+	UMjActuatorRuntime::SetControl(Actuator, Park);
+	// The staging slot can be gone mid-recompile (SetControl then no-ops):
+	// only report released if the value actually landed.
+	return FMath::IsNearlyEqual(static_cast<float>(UMjActuatorRuntime::GetControl(Actuator)), Park, 1e-4f);
+}
+
 bool FRammsMujocoActuationBackend::GetMotorTransform(FName MotorId, FTransform& OutWorld) const
 {
 	// <actuator> elements live at the model root, so the actuator node's own
