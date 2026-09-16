@@ -18,14 +18,17 @@ public class RammsMujocoSupport : ModuleRules
 			// libs publicly, so depending on it gives us the MuJoCo C API + the
 			// UMjArticulationController base class.
 			"URLab",
+			// IRammsControlContributor lives in RammsCore, but the control types it
+			// speaks (FRammsControlSurface / axis) come from ramms-ui's RammsControl.
+			"RammsControl",
+			// The robot base component + IRammsActuationBackend interface, the
+			// cross-plugin actuation-backend registry we register into at startup,
+			// and IRammsControlContributor (inherited by public headers here).
+			"RammsCore",
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
-			// The robot base component + IRammsActuationBackend interface and the
-			// cross-plugin actuation-backend registry we register into at startup.
-			// Private: only this module's .cpp/private headers use them.
-			"RammsCore",
 			// Runtime-built meshes for the compiled-geom renderer (visuals for
 			// <attach>/<model>-spliced content that has no URLab components).
 			"ProceduralMeshComponent",

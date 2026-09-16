@@ -119,6 +119,10 @@ public:
 	virtual FString GetKindName() const override { return TEXT("ee_ik"); }
 
 private:
+	/** Articulation reset: drop the target and grip so they re-seed from the reset pose. */
+	UFUNCTION()
+	void HandleSimulationReset();
+
 	// Resolved at Bind:
 	int32 EeSiteId = -1;
 	int32 BaseBodyId = -1;       // arm root body (direct child of world); target frame when bTrackBaseFrame
