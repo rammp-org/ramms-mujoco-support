@@ -3,8 +3,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/CriticalSection.h"
 #include "RammsActuationBackend.h"
 #include "UObject/WeakObjectPtr.h"
+
+struct mjModel_;
+struct mjData_;
 
 class AMjArticulation;
 class UMjNodeComponent;
@@ -50,6 +54,14 @@ public:
 	virtual float GetVelocity(FName MotorId) const override;
 	virtual bool  ReleaseMotor(FName MotorId) override;
 	virtual bool  GetMotorTransform(FName MotorId, FTransform& OutWorld) const override;
+	/** mjData::time of the engine stepping this articulation. */
+	virtual double GetSimulationTime() const override;
+	/** Runs the loop in a URLab pre-step callback, every physics step. */
+	virtual bool SetVelocityDrive(FName MotorId, float TargetRate, const FRammsVelocityGains& Gains,
+		float TorqueMin, float TorqueMax) override;
+	virtual void ClearVelocityDrive(FName MotorId) override;
+
+	virtual ~FRammsMujocoActuationBackend() override;
 
 private:
 	/** The joint an actuator's transmission drives, plus what a read needs. */
@@ -77,4 +89,38 @@ private:
 
 	/** Motors already warned about for a non-joint transmission. */
 	mutable TSet<FName> WarnedUnsupported;
+
+	/** One motor's speed loop, as the physics thread runs it. */
+	struct FPhysicsDrive
+	{
+		int32  ActuatorId = INDEX_NONE;
+		int32  DofAdr = INDEX_NONE;
+		double Scale = 1.0; // robot units per qvel unit (100 for a slide joint)
+		double Target = 0.0;
+		double Kp = 0.0;
+		double Ki = 0.0;
+		double MaxIntegral = 0.0;
+		double Lo = 0.0;
+		double Hi = 0.0;
+		double Integral = 0.0;
+	};
+
+	/**
+	 * The loops, shared with the pre-step callback. The callback outlives this
+	 * backend -- URLab has no way to unregister one -- so it holds the table,
+	 * and the destructor marks the table dead under its lock rather than
+	 * freeing anything the physics thread may be reading.
+	 */
+	struct FDriveTable
+	{
+		FCriticalSection		   Lock;
+		TMap<FName, FPhysicsDrive> Drives;
+		AMjArticulation*		   Articulation = nullptr;
+		bool					   bAlive = true;
+	};
+	TSharedPtr<FDriveTable, ESPMode::ThreadSafe> DriveTable;
+	bool										 bDriveCallbackRegistered = false;
+
+	/** One physics step of every loop; physics thread, under CallbackMutex. */
+	static void StepDrives(FDriveTable& Table, const mjModel_* Model, const mjData_* Data);
 };

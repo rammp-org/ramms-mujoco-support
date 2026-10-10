@@ -274,3 +274,131 @@ bool FRammsMujocoActuationBackend::GetMotorTransform(FName MotorId, FTransform& 
 	OutWorld = Body->GetComponentTransform();
 	return true;
 }
+
+FRammsMujocoActuationBackend::~FRammsMujocoActuationBackend()
+{
+	if (DriveTable)
+	{
+		FScopeLock Lock(&DriveTable->Lock);
+		DriveTable->bAlive = false;
+		DriveTable->Drives.Reset();
+		DriveTable->Articulation = nullptr;
+	}
+}
+
+bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetRate, const FRammsVelocityGains& Gains,
+	float TorqueMin, float TorqueMax)
+{
+	UMjNodeComponent*	 Actuator = ResolveActuator(MotorId);
+	const FTransmission* Transmission = ResolveTransmission(MotorId);
+	if (!Actuator || !Transmission || !Articulation.IsValid())
+	{
+		return false; // not compiled yet: the base runs the loop meanwhile
+	}
+	const TOptional<int32>& Bound = Actuator->GetBoundId();
+	UMjPhysicsEngine*		Engine = AAMjManager::ResolveEngine(Actuator);
+	const mjModel*			Model = Engine ? Engine->GetModel() : nullptr;
+	if (!Bound.IsSet() || !Model)
+	{
+		return false;
+	}
+	const int32 ActuatorId = Bound.GetValue();
+	if (ActuatorId < 0 || ActuatorId >= Model->nu || Model->actuator_trntype[ActuatorId] != mjTRN_JOINT)
+	{
+		return false;
+	}
+	const int32 Joint = Model->actuator_trnid[2 * ActuatorId];
+	if (Joint < 0 || Joint >= Model->njnt)
+	{
+		return false;
+	}
+
+	if (!DriveTable)
+	{
+		DriveTable = MakeShared<FDriveTable, ESPMode::ThreadSafe>();
+	}
+	{
+		FScopeLock	   Lock(&DriveTable->Lock);
+		FPhysicsDrive& Drive = DriveTable->Drives.FindOrAdd(MotorId);
+		if (Drive.ActuatorId != ActuatorId)
+		{
+			Drive = FPhysicsDrive(); // a recompile can move the ids
+		}
+		DriveTable->Articulation = Articulation.Get();
+		Drive.ActuatorId = ActuatorId;
+		Drive.DofAdr = Model->jnt_dofadr[Joint];
+		Drive.Scale = Transmission->bSlide ? 100.0 : 1.0;
+		Drive.Target = TargetRate;
+		Drive.Kp = Gains.Kp;
+		Drive.Ki = Gains.Ki;
+		Drive.MaxIntegral = Gains.MaxIntegralTorque;
+		Drive.Lo = TorqueMin;
+		Drive.Hi = TorqueMax;
+	}
+	if (!bDriveCallbackRegistered)
+	{
+		TSharedPtr<FDriveTable, ESPMode::ThreadSafe> Table = DriveTable;
+		Engine->RegisterPreStepCallback([Table](mjModel* M, mjData* D) { StepDrives(*Table, M, D); });
+		bDriveCallbackRegistered = true;
+	}
+	return true;
+}
+
+void FRammsMujocoActuationBackend::ClearVelocityDrive(FName MotorId)
+{
+	if (DriveTable)
+	{
+		FScopeLock Lock(&DriveTable->Lock);
+		DriveTable->Drives.Remove(MotorId);
+	}
+}
+
+void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, const mjModel_* Model, const mjData_* Data)
+{
+	FScopeLock Lock(&Table.Lock);
+	if (!Table.bAlive || !Table.Articulation || !Model || !Data)
+	{
+		return;
+	}
+	const double Dt = Model->opt.timestep;
+	for (TPair<FName, FPhysicsDrive>& Pair : Table.Drives)
+	{
+		FPhysicsDrive& Drive = Pair.Value;
+		if (Drive.ActuatorId < 0 || Drive.ActuatorId >= Model->nu || Drive.DofAdr < 0 || Drive.DofAdr >= Model->nv)
+		{
+			continue;
+		}
+		// The same PI the base runs, in the joint's sense: integral capped,
+		// held while the output is saturated so it does not wind up.
+		const double Error = Drive.Target - Data->qvel[Drive.DofAdr] * Drive.Scale;
+		double		 Integral = Drive.Integral + Drive.Ki * Error * Dt;
+		if (Drive.MaxIntegral > 0.0)
+		{
+			Integral = FMath::Clamp(Integral, -Drive.MaxIntegral, Drive.MaxIntegral);
+		}
+		double Output = Drive.Kp * Error + Integral;
+		if (Drive.Lo < Drive.Hi)
+		{
+			const double Clamped = FMath::Clamp(Output, Drive.Lo, Drive.Hi);
+			if (Clamped != Output)
+			{
+				Integral = Drive.Integral;
+			}
+			Output = Clamped;
+		}
+		Drive.Integral = Integral;
+		// Staged, not written to mjData: URLab's ApplyControls copies staged
+		// controls into ctrl right after the pre-step callbacks, so a direct
+		// write would be overwritten in the same step.
+		Table.Articulation->StageInternalControl(Drive.ActuatorId, Output);
+	}
+}
+
+double FRammsMujocoActuationBackend::GetSimulationTime() const
+{
+	// mjData::time rather than the manager's float, which loses the
+	// millisecond a controller differentiates against after a few hours.
+	const UMjPhysicsEngine* Engine = Articulation.IsValid() ? AAMjManager::ResolveEngine(Articulation.Get()) : nullptr;
+	const mjData*			Data = Engine ? Engine->GetData() : nullptr;
+	return Data ? Data->time : -1.0;
+}
