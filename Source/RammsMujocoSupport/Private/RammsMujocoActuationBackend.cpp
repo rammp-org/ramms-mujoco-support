@@ -6,6 +6,7 @@
 #include "MuJoCo/Core/AMjManager.h"
 #include "MuJoCo/Core/MjArticulation.h"
 #include "MuJoCo/Core/MjPhysicsEngine.h"
+#include "MuJoCo/Core/MjRenderSnapshot.h"
 #include "MuJoCo/Elements/MjActuatorRuntime.h"
 #include "MuJoCo/Elements/MjBody.h"
 #include "MuJoCo/Elements/MjJointRuntime.h"
@@ -273,4 +274,165 @@ bool FRammsMujocoActuationBackend::GetMotorTransform(FName MotorId, FTransform& 
 	}
 	OutWorld = Body->GetComponentTransform();
 	return true;
+}
+
+FRammsMujocoActuationBackend::~FRammsMujocoActuationBackend()
+{
+	if (DriveTable)
+	{
+		FScopeLock Lock(&DriveTable->Lock);
+		DriveTable->bAlive = false;
+		DriveTable->Drives.Reset();
+		DriveTable->Articulation = nullptr;
+	}
+}
+
+bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetRate, const FRammsVelocityGains& Gains,
+	float TorqueMin, float TorqueMax)
+{
+	// False hands the loop back to the base, which then commands the motor once
+	// per tick. A loop this backend was already running would otherwise stay in
+	// the table and keep staging its old output from the physics thread every
+	// step, over the base's command, so every refusal drops it first.
+	const auto Refuse = [this, MotorId]() -> bool {
+		ClearVelocityDrive(MotorId);
+		return false;
+	};
+	UMjNodeComponent*	 Actuator = ResolveActuator(MotorId);
+	const FTransmission* Transmission = ResolveTransmission(MotorId);
+	if (!Actuator || !Transmission || !Articulation.IsValid())
+	{
+		return Refuse(); // not compiled yet: the base runs the loop meanwhile
+	}
+	const TOptional<int32>& Bound = Actuator->GetBoundId();
+	UMjPhysicsEngine*		Engine = AAMjManager::ResolveEngine(Actuator);
+	const mjModel*			Model = Engine ? Engine->GetModel() : nullptr;
+	if (!Bound.IsSet() || !Model)
+	{
+		return Refuse();
+	}
+	const int32 ActuatorId = Bound.GetValue();
+	if (ActuatorId < 0 || ActuatorId >= Model->nu || Model->actuator_trntype[ActuatorId] != mjTRN_JOINT)
+	{
+		return Refuse();
+	}
+	const int32 Joint = Model->actuator_trnid[2 * ActuatorId];
+	if (Joint < 0 || Joint >= Model->njnt)
+	{
+		return Refuse();
+	}
+
+	if (!DriveTable)
+	{
+		DriveTable = MakeShared<FDriveTable, ESPMode::ThreadSafe>();
+	}
+	{
+		FScopeLock	   Lock(&DriveTable->Lock);
+		FPhysicsDrive& Drive = DriveTable->Drives.FindOrAdd(MotorId);
+		if (Drive.ActuatorId != ActuatorId)
+		{
+			Drive = FPhysicsDrive(); // a recompile can move the ids
+		}
+		// A retune starts the integral over, as the base's own loop does: torque
+		// accumulated under the old gains would be applied at once under the new
+		// ones (and never bleed off with Ki 0). The same gains arrive every tick,
+		// so this only fires on a real change.
+		if (Drive.Kp != Gains.Kp || Drive.Ki != Gains.Ki || Drive.MaxIntegral != Gains.MaxIntegralTorque)
+		{
+			Drive.Integral = 0.0;
+		}
+		DriveTable->Articulation = Articulation.Get();
+		Drive.ActuatorId = ActuatorId;
+		Drive.DofAdr = Model->jnt_dofadr[Joint];
+		Drive.Scale = Transmission->bSlide ? 100.0 : 1.0;
+		Drive.Target = TargetRate;
+		Drive.Kp = Gains.Kp;
+		Drive.Ki = Gains.Ki;
+		Drive.MaxIntegral = Gains.MaxIntegralTorque;
+		Drive.Lo = TorqueMin;
+		Drive.Hi = TorqueMax;
+	}
+	if (!bDriveCallbackRegistered)
+	{
+		TSharedPtr<FDriveTable, ESPMode::ThreadSafe> Table = DriveTable;
+		Engine->RegisterPreStepCallback([Table](mjModel* M, mjData* D) { StepDrives(*Table, M, D); });
+		bDriveCallbackRegistered = true;
+	}
+	return true;
+}
+
+void FRammsMujocoActuationBackend::ClearVelocityDrive(FName MotorId)
+{
+	if (DriveTable)
+	{
+		FScopeLock Lock(&DriveTable->Lock);
+		DriveTable->Drives.Remove(MotorId);
+	}
+}
+
+void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, const mjModel_* Model, const mjData_* Data)
+{
+	FScopeLock Lock(&Table.Lock);
+	if (!Table.bAlive || !Table.Articulation || !Model || !Data)
+	{
+		return;
+	}
+	const double Dt = Model->opt.timestep;
+	for (TPair<FName, FPhysicsDrive>& Pair : Table.Drives)
+	{
+		FPhysicsDrive& Drive = Pair.Value;
+		if (Drive.ActuatorId < 0 || Drive.ActuatorId >= Model->nu || Drive.DofAdr < 0 || Drive.DofAdr >= Model->nv)
+		{
+			continue;
+		}
+		// The same PI the base runs, in the joint's sense: integral capped,
+		// held while the output is saturated so it does not wind up.
+		const double Error = Drive.Target - Data->qvel[Drive.DofAdr] * Drive.Scale;
+		double		 Integral = Drive.Integral + Drive.Ki * Error * Dt;
+		if (Drive.MaxIntegral > 0.0)
+		{
+			Integral = FMath::Clamp(Integral, -Drive.MaxIntegral, Drive.MaxIntegral);
+		}
+		double Output = Drive.Kp * Error + Integral;
+		if (Drive.Lo < Drive.Hi)
+		{
+			const double Clamped = FMath::Clamp(Output, Drive.Lo, Drive.Hi);
+			if (Clamped != Output)
+			{
+				Integral = Drive.Integral;
+			}
+			Output = Clamped;
+		}
+		Drive.Integral = Integral;
+		// Staged, not written to mjData: URLab's ApplyControls copies staged
+		// controls into ctrl right after the pre-step callbacks, so a direct
+		// write would be overwritten in the same step.
+		Table.Articulation->StageInternalControl(Drive.ActuatorId, Output);
+	}
+}
+
+double FRammsMujocoActuationBackend::GetSimulationTime() const
+{
+	// The time of the snapshot URLab last published, not live mjData::time:
+	// the worker advances that mid-step, under a lock it holds for the whole
+	// step, and RK4 writes its stage times there and then rewinds, so an
+	// unlocked read can see time run backwards, which a controller takes for a
+	// reset. GetValue and GetVelocity read the same published snapshots
+	// (URLab's joint accessors do), so the clock, like the measurements, is
+	// always the state at the end of a step. A double, unlike the manager's
+	// float, which loses the millisecond a controller differentiates against
+	// after a few hours.
+	const UMjPhysicsEngine* Engine = Articulation.IsValid() ? AAMjManager::ResolveEngine(Articulation.Get()) : nullptr;
+	if (!Engine)
+	{
+		return -1.0;
+	}
+	double Time = -1.0;
+	Engine->WithRenderState([&Time](const FMjRenderSnapshot& Snapshot) {
+		if (Snapshot.FrameId > 0) // nothing is published before the first compile
+		{
+			Time = Snapshot.SimTime;
+		}
+	});
+	return Time;
 }
