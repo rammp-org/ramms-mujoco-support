@@ -6,6 +6,7 @@
 #include "MuJoCo/Core/AMjManager.h"
 #include "MuJoCo/Core/MjArticulation.h"
 #include "MuJoCo/Core/MjPhysicsEngine.h"
+#include "MuJoCo/Core/MjRenderSnapshot.h"
 #include "MuJoCo/Elements/MjActuatorRuntime.h"
 #include "MuJoCo/Elements/MjBody.h"
 #include "MuJoCo/Elements/MjJointRuntime.h"
@@ -289,28 +290,36 @@ FRammsMujocoActuationBackend::~FRammsMujocoActuationBackend()
 bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetRate, const FRammsVelocityGains& Gains,
 	float TorqueMin, float TorqueMax)
 {
+	// False hands the loop back to the base, which then commands the motor once
+	// per tick. A loop this backend was already running would otherwise stay in
+	// the table and keep staging its old output from the physics thread every
+	// step, over the base's command, so every refusal drops it first.
+	const auto Refuse = [this, MotorId]() -> bool {
+		ClearVelocityDrive(MotorId);
+		return false;
+	};
 	UMjNodeComponent*	 Actuator = ResolveActuator(MotorId);
 	const FTransmission* Transmission = ResolveTransmission(MotorId);
 	if (!Actuator || !Transmission || !Articulation.IsValid())
 	{
-		return false; // not compiled yet: the base runs the loop meanwhile
+		return Refuse(); // not compiled yet: the base runs the loop meanwhile
 	}
 	const TOptional<int32>& Bound = Actuator->GetBoundId();
 	UMjPhysicsEngine*		Engine = AAMjManager::ResolveEngine(Actuator);
 	const mjModel*			Model = Engine ? Engine->GetModel() : nullptr;
 	if (!Bound.IsSet() || !Model)
 	{
-		return false;
+		return Refuse();
 	}
 	const int32 ActuatorId = Bound.GetValue();
 	if (ActuatorId < 0 || ActuatorId >= Model->nu || Model->actuator_trntype[ActuatorId] != mjTRN_JOINT)
 	{
-		return false;
+		return Refuse();
 	}
 	const int32 Joint = Model->actuator_trnid[2 * ActuatorId];
 	if (Joint < 0 || Joint >= Model->njnt)
 	{
-		return false;
+		return Refuse();
 	}
 
 	if (!DriveTable)
@@ -323,6 +332,14 @@ bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetR
 		if (Drive.ActuatorId != ActuatorId)
 		{
 			Drive = FPhysicsDrive(); // a recompile can move the ids
+		}
+		// A retune starts the integral over, as the base's own loop does: torque
+		// accumulated under the old gains would be applied at once under the new
+		// ones (and never bleed off with Ki 0). The same gains arrive every tick,
+		// so this only fires on a real change.
+		if (Drive.Kp != Gains.Kp || Drive.Ki != Gains.Ki || Drive.MaxIntegral != Gains.MaxIntegralTorque)
+		{
+			Drive.Integral = 0.0;
 		}
 		DriveTable->Articulation = Articulation.Get();
 		Drive.ActuatorId = ActuatorId;
@@ -396,9 +413,26 @@ void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, const mjModel_
 
 double FRammsMujocoActuationBackend::GetSimulationTime() const
 {
-	// mjData::time rather than the manager's float, which loses the
-	// millisecond a controller differentiates against after a few hours.
+	// The time of the snapshot URLab last published, not live mjData::time:
+	// the worker advances that mid-step, under a lock it holds for the whole
+	// step, and RK4 writes its stage times there and then rewinds, so an
+	// unlocked read can see time run backwards, which a controller takes for a
+	// reset. GetValue and GetVelocity read the same published snapshots
+	// (URLab's joint accessors do), so the clock, like the measurements, is
+	// always the state at the end of a step. A double, unlike the manager's
+	// float, which loses the millisecond a controller differentiates against
+	// after a few hours.
 	const UMjPhysicsEngine* Engine = Articulation.IsValid() ? AAMjManager::ResolveEngine(Articulation.Get()) : nullptr;
-	const mjData*			Data = Engine ? Engine->GetData() : nullptr;
-	return Data ? Data->time : -1.0;
+	if (!Engine)
+	{
+		return -1.0;
+	}
+	double Time = -1.0;
+	Engine->WithRenderState([&Time](const FMjRenderSnapshot& Snapshot) {
+		if (Snapshot.FrameId > 0) // nothing is published before the first compile
+		{
+			Time = Snapshot.SimTime;
+		}
+	});
+	return Time;
 }

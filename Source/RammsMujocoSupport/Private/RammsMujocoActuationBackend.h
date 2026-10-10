@@ -54,7 +54,8 @@ public:
 	virtual float GetVelocity(FName MotorId) const override;
 	virtual bool  ReleaseMotor(FName MotorId) override;
 	virtual bool  GetMotorTransform(FName MotorId, FTransform& OutWorld) const override;
-	/** mjData::time of the engine stepping this articulation. */
+	/** mjData::time as of the last snapshot the engine stepping this articulation
+	 *  published; negative before the first one. */
 	virtual double GetSimulationTime() const override;
 	/** Runs the loop in a URLab pre-step callback, every physics step. */
 	virtual bool SetVelocityDrive(FName MotorId, float TargetRate, const FRammsVelocityGains& Gains,
