@@ -32,6 +32,11 @@ public class RammsMujocoSupport : ModuleRules
 			// Runtime-built meshes for the compiled-geom renderer (visuals for
 			// <attach>/<model>-spliced content that has no URLab components).
 			"ProceduralMeshComponent",
+			// The Chaos articulation builder: runtime convex shapes, mass properties and a physics-rate
+			// callback on the world's solver.
+			"PhysicsCore",
+			"Chaos",
+			"ChaosCore",
 		});
 	}
 }
