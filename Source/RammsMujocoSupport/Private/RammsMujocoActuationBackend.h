@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "HAL/CriticalSection.h"
 #include "RammsActuationBackend.h"
+#include "RammsMotionProfile.h"
 #include "UObject/WeakObjectPtr.h"
 
 struct mjModel_;
@@ -12,6 +13,7 @@ struct mjData_;
 
 class AMjArticulation;
 class UMjNodeComponent;
+class UMjPhysicsEngine;
 
 /**
  * IRammsActuationBackend backed by a URLab/MuJoCo articulation.
@@ -61,6 +63,10 @@ public:
 	virtual bool SetVelocityDrive(FName MotorId, float TargetRate, const FRammsVelocityGains& Gains,
 		float TorqueMin, float TorqueMax) override;
 	virtual void ClearVelocityDrive(FName MotorId) override;
+	/** Steps the profile in the same pre-step callback, every physics step. */
+	virtual bool SetPositionProfile(FName MotorId, float Target, float MaxVelocity, float MaxAcceleration,
+		float StartFrom) override;
+	virtual void ClearPositionProfile(FName MotorId) override;
 
 	virtual ~FRammsMujocoActuationBackend() override;
 
@@ -110,22 +116,52 @@ private:
 		double Integral = 0.0;
 	};
 
+	/** One position actuator's profile (SetPositionProfile), as the physics
+	 *  thread steps it. Target and the setpoint are in ctrl's units. */
+	struct FPhysicsProfile
+	{
+		int32				   ActuatorId = INDEX_NONE;
+		int32				   QposAdr = INDEX_NONE;
+		double				   Scale = 1.0; // robot units per qpos unit (100 for a slide joint)
+		double				   Lo = 0.0;	// ctrlrange; Lo >= Hi: none
+		double				   Hi = 0.0;
+		double				   MaxVelocity = 0.0;
+		double				   MaxAcceleration = 0.0;
+		double				   Target = 0.0;
+		double				   StartFrom = 0.0;
+		bool				   bStartGiven = false;
+		uint32				   Commands = 0; // counts every command; the physics thread notes the last it saw
+		uint32				   SeenCommands = 0;
+		bool				   bStarted = false;
+		RammsMotion::FFollower Follower;
+	};
+
 	/**
-	 * The loops, shared with the pre-step callback. The callback outlives this
-	 * backend -- URLab has no way to unregister one -- so it holds the table,
-	 * and the destructor marks the table dead under its lock rather than
-	 * freeing anything the physics thread may be reading.
+	 * The loops and profiles, shared with the pre-step callback. The callback
+	 * outlives this backend -- URLab has no way to unregister one -- so it
+	 * holds the table, and the destructor marks the table dead under its lock
+	 * rather than freeing anything the physics thread may be reading.
 	 */
 	struct FDriveTable
 	{
-		FCriticalSection		   Lock;
-		TMap<FName, FPhysicsDrive> Drives;
-		AMjArticulation*		   Articulation = nullptr;
-		bool					   bAlive = true;
+		FCriticalSection			 Lock;
+		TMap<FName, FPhysicsDrive>	 Drives;
+		TMap<FName, FPhysicsProfile> Profiles;
+		AMjArticulation*			 Articulation = nullptr;
+		bool						 bAlive = true;
+		/** mjData::time at the last callback; negative before the first. */
+		double LastTime = -1.0;
 	};
 	TSharedPtr<FDriveTable, ESPMode::ThreadSafe> DriveTable;
 	bool										 bDriveCallbackRegistered = false;
 
-	/** One physics step of every loop; physics thread, under CallbackMutex. */
-	static void StepDrives(FDriveTable& Table, const mjModel_* Model, const mjData_* Data);
+	/** The table, made on first use, and the callback that steps it registered
+	 *  with Engine. */
+	FDriveTable& EnsureDriveTable(UMjPhysicsEngine& Engine);
+
+	/** One physics step of every loop and profile; physics thread, under
+	 *  CallbackMutex. Time is the simulation's: no step while it is paused. */
+	static void StepTable(FDriveTable& Table, const mjModel_* Model, const mjData_* Data);
+	static void StepDrives(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt);
+	static void StepProfiles(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt);
 };

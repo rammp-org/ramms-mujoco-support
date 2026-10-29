@@ -157,6 +157,9 @@ const FRammsMujocoActuationBackend::FTransmission* FRammsMujocoActuationBackend:
 
 void FRammsMujocoActuationBackend::SetCommand(FName MotorId, float Value)
 {
+	// A command staged directly wins over a profile, which would otherwise
+	// stage over it from the physics thread every step.
+	ClearPositionProfile(MotorId);
 	UMjNodeComponent* Actuator = ResolveActuator(MotorId);
 	if (!Actuator)
 	{
@@ -208,6 +211,7 @@ bool FRammsMujocoActuationBackend::ReleaseMotor(FName MotorId)
 	//    actuator LENGTH — gear- and transmission-aware — not the joint qpos.
 	//  - <velocity> (bias kv only):  ctrl 0 would BRAKE the joint     -> false
 	//  - anything with actuator dynamics (intvelocity, general):      -> false
+	ClearPositionProfile(MotorId);
 	UMjNodeComponent* Actuator = ResolveActuator(MotorId);
 	if (!Actuator)
 	{
@@ -286,6 +290,7 @@ FRammsMujocoActuationBackend::~FRammsMujocoActuationBackend()
 		FScopeLock Lock(&DriveTable->Lock);
 		DriveTable->bAlive = false;
 		DriveTable->Drives.Reset();
+		DriveTable->Profiles.Reset();
 		DriveTable->Articulation = nullptr;
 	}
 }
@@ -325,13 +330,10 @@ bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetR
 		return Refuse();
 	}
 
-	if (!DriveTable)
+	FDriveTable& Table = EnsureDriveTable(*Engine);
 	{
-		DriveTable = MakeShared<FDriveTable, ESPMode::ThreadSafe>();
-	}
-	{
-		FScopeLock	   Lock(&DriveTable->Lock);
-		FPhysicsDrive& Drive = DriveTable->Drives.FindOrAdd(MotorId);
+		FScopeLock	   Lock(&Table.Lock);
+		FPhysicsDrive& Drive = Table.Drives.FindOrAdd(MotorId);
 		if (Drive.ActuatorId != ActuatorId)
 		{
 			Drive = FPhysicsDrive(); // a recompile can move the ids
@@ -344,7 +346,7 @@ bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetR
 		{
 			Drive.Integral = 0.0;
 		}
-		DriveTable->Articulation = Articulation.Get();
+		Table.Articulation = Articulation.Get();
 		Drive.ActuatorId = ActuatorId;
 		Drive.DofAdr = Model->jnt_dofadr[Joint];
 		Drive.Scale = Transmission->bSlide ? 100.0 : 1.0;
@@ -354,12 +356,6 @@ bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetR
 		Drive.MaxIntegral = Gains.MaxIntegralTorque;
 		Drive.Lo = TorqueMin;
 		Drive.Hi = TorqueMax;
-	}
-	if (!bDriveCallbackRegistered)
-	{
-		TSharedPtr<FDriveTable, ESPMode::ThreadSafe> Table = DriveTable;
-		Engine->RegisterPreStepCallback([Table](mjModel* M, mjData* D) { StepDrives(*Table, M, D); });
-		bDriveCallbackRegistered = true;
 	}
 	return true;
 }
@@ -373,14 +369,163 @@ void FRammsMujocoActuationBackend::ClearVelocityDrive(FName MotorId)
 	}
 }
 
-void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, const mjModel_* Model, const mjData_* Data)
+bool FRammsMujocoActuationBackend::SetPositionProfile(FName MotorId, float Target, float MaxVelocity, float MaxAcceleration,
+	float StartFrom)
+{
+	// False hands the profile back to the base, which then steps it once per
+	// tick; one this backend was running would otherwise stage over the base's
+	// setpoint every step, so every refusal drops it first.
+	const auto Refuse = [this, MotorId]() -> bool {
+		ClearPositionProfile(MotorId);
+		return false;
+	};
+	UMjNodeComponent*	 Actuator = ResolveActuator(MotorId);
+	const FTransmission* Transmission = ResolveTransmission(MotorId);
+	if (!Actuator || !Transmission || !Articulation.IsValid())
+	{
+		return Refuse(); // not compiled yet: the base eases it meanwhile
+	}
+	const TOptional<int32>& Bound = Actuator->GetBoundId();
+	UMjPhysicsEngine*		Engine = AAMjManager::ResolveEngine(Actuator);
+	const mjModel*			Model = Engine ? Engine->GetModel() : nullptr;
+	if (!Bound.IsSet() || !Model)
+	{
+		return Refuse();
+	}
+	const int32 ActuatorId = Bound.GetValue();
+	if (ActuatorId < 0 || ActuatorId >= Model->nu || Model->actuator_trntype[ActuatorId] != mjTRN_JOINT)
+	{
+		return Refuse();
+	}
+	const int32 Joint = Model->actuator_trnid[2 * ActuatorId];
+	if (Joint < 0 || Joint >= Model->njnt)
+	{
+		return Refuse();
+	}
+	// Clamped as SetCommand clamps what it stages.
+	const FVector2D Range = UMjActuatorRuntime::GetControlRange(Actuator);
+
+	FDriveTable&	 Table = EnsureDriveTable(*Engine);
+	FScopeLock		 Lock(&Table.Lock);
+	FPhysicsProfile& Profile = Table.Profiles.FindOrAdd(MotorId);
+	if (Profile.ActuatorId != ActuatorId)
+	{
+		Profile = FPhysicsProfile(); // a recompile can move the ids
+	}
+	Table.Articulation = Articulation.Get();
+	Profile.ActuatorId = ActuatorId;
+	Profile.QposAdr = Model->jnt_qposadr[Joint];
+	Profile.Scale = Transmission->bSlide ? 100.0 : 1.0;
+	Profile.Lo = Range.X;
+	Profile.Hi = Range.Y;
+	Profile.MaxVelocity = MaxVelocity;
+	Profile.MaxAcceleration = MaxAcceleration;
+	Profile.Target = Target;
+	if (!Profile.bStarted && FMath::IsFinite(StartFrom))
+	{
+		Profile.StartFrom = StartFrom;
+		Profile.bStartGiven = true;
+	}
+	++Profile.Commands;
+	return true;
+}
+
+void FRammsMujocoActuationBackend::ClearPositionProfile(FName MotorId)
+{
+	if (DriveTable)
+	{
+		FScopeLock Lock(&DriveTable->Lock);
+		DriveTable->Profiles.Remove(MotorId);
+	}
+}
+
+FRammsMujocoActuationBackend::FDriveTable& FRammsMujocoActuationBackend::EnsureDriveTable(UMjPhysicsEngine& Engine)
+{
+	if (!DriveTable)
+	{
+		DriveTable = MakeShared<FDriveTable, ESPMode::ThreadSafe>();
+	}
+	if (!bDriveCallbackRegistered)
+	{
+		TSharedPtr<FDriveTable, ESPMode::ThreadSafe> Table = DriveTable;
+		Engine.RegisterPreStepCallback([Table](mjModel* M, mjData* D) { StepTable(*Table, M, D); });
+		bDriveCallbackRegistered = true;
+	}
+	return *DriveTable;
+}
+
+void FRammsMujocoActuationBackend::StepTable(FDriveTable& Table, const mjModel_* Model, const mjData_* Data)
 {
 	FScopeLock Lock(&Table.Lock);
 	if (!Table.bAlive || !Table.Articulation || !Model || !Data)
 	{
 		return;
 	}
-	const double Dt = Model->opt.timestep;
+	// The time since the last callback, on the simulation's own clock: none
+	// while it is paused (the callbacks still run then, and a loop integrating
+	// a fixed timestep would wind up) and the whole batch when one request
+	// steps several. A clock gone back is a reset: the robot is back at its
+	// start, so every loop and profile starts over.
+	const double Now = Data->time;
+	double		 Dt = 0.0;
+	if (Table.LastTime >= 0.0 && Now < Table.LastTime)
+	{
+		for (TPair<FName, FPhysicsDrive>& Pair : Table.Drives)
+		{
+			Pair.Value.Integral = 0.0;
+		}
+		for (TPair<FName, FPhysicsProfile>& Pair : Table.Profiles)
+		{
+			Pair.Value.bStarted = false;
+		}
+	}
+	else if (Table.LastTime >= 0.0)
+	{
+		Dt = Now - Table.LastTime;
+	}
+	Table.LastTime = Now;
+	StepDrives(Table, Model, Data, Dt);
+	StepProfiles(Table, Model, Data, Dt);
+}
+
+void FRammsMujocoActuationBackend::StepProfiles(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt)
+{
+	// Each profile is stepped over the time since the last callback and its
+	// setpoint staged for the step about to run; a command is taken as given at
+	// the start of that time.
+	const double From = Data->time - Dt;
+	for (TPair<FName, FPhysicsProfile>& Pair : Table.Profiles)
+	{
+		FPhysicsProfile& Profile = Pair.Value;
+		if (Profile.ActuatorId < 0 || Profile.ActuatorId >= Model->nu || Profile.QposAdr < 0 || Profile.QposAdr >= Model->nq)
+		{
+			continue;
+		}
+		if (!Profile.bStarted)
+		{
+			// Where the base says (where the joint stood when it was first
+			// commanded), else -- after a reset -- where the joint is now.
+			Profile.Follower.Reset(Profile.bStartGiven ? Profile.StartFrom : Data->qpos[Profile.QposAdr] * Profile.Scale);
+			Profile.bStartGiven = false;
+			Profile.bStarted = true;
+			Profile.SeenCommands = Profile.Commands - 1;
+		}
+		if (Profile.SeenCommands != Profile.Commands)
+		{
+			Profile.Follower.Command(Profile.Target, From);
+			Profile.SeenCommands = Profile.Commands;
+		}
+		double Setpoint = Profile.Follower.Step(From, Dt, Profile.MaxVelocity, Profile.MaxAcceleration);
+		if (Profile.Lo < Profile.Hi)
+		{
+			Setpoint = FMath::Clamp(Setpoint, Profile.Lo, Profile.Hi);
+		}
+		Table.Articulation->StageInternalControl(Profile.ActuatorId, Setpoint);
+	}
+}
+
+void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt)
+{
 	for (TPair<FName, FPhysicsDrive>& Pair : Table.Drives)
 	{
 		FPhysicsDrive& Drive = Pair.Value;

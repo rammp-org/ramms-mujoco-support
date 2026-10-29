@@ -198,3 +198,21 @@ void FRammsArticulationActuationBackend::ClearVelocityDrive(FName MotorId)
 	Mujoco.ClearVelocityDrive(MotorId);
 	Chaos.ClearVelocityDrive(MotorId);
 }
+
+bool FRammsArticulationActuationBackend::SetPositionProfile(FName MotorId, float Target, float MaxVelocity,
+	float MaxAcceleration, float StartFrom)
+{
+	// As for a speed loop: only the active engine eases a profile.
+	IRammsActuationBackend& Engine = Active();
+	IRammsActuationBackend& Other = &Engine == static_cast<IRammsActuationBackend*>(&Chaos)
+		? static_cast<IRammsActuationBackend&>(Mujoco)
+		: static_cast<IRammsActuationBackend&>(Chaos);
+	Other.ClearPositionProfile(MotorId);
+	return Engine.SetPositionProfile(MotorId, Target, MaxVelocity, MaxAcceleration, StartFrom);
+}
+
+void FRammsArticulationActuationBackend::ClearPositionProfile(FName MotorId)
+{
+	Mujoco.ClearPositionProfile(MotorId);
+	Chaos.ClearPositionProfile(MotorId);
+}

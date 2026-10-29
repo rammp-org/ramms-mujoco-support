@@ -78,6 +78,9 @@ public:
 	virtual bool   SetVelocityDrive(FName MotorId, float TargetRate, const FRammsVelocityGains& Gains,
 		float TorqueMin, float TorqueMax) override;
 	virtual void   ClearVelocityDrive(FName MotorId) override;
+	virtual bool   SetPositionProfile(FName MotorId, float Target, float MaxVelocity, float MaxAcceleration,
+		float StartFrom) override;
+	virtual void   ClearPositionProfile(FName MotorId) override;
 	virtual bool   SimulatesMotorJoint(FName MotorId) const override { return Active().SimulatesMotorJoint(MotorId); }
 	virtual bool   SetMotorBrake(FName MotorId, bool bEngaged) override { return Active().SetMotorBrake(MotorId, bEngaged); }
 
