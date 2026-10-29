@@ -62,6 +62,12 @@ private:
 class FRammsArticulationActuationBackend final : public IRammsActuationBackend
 {
 public:
+	/** bSwitchToChaos: RammsCore's Chaos articulation backend (Backend = Chaos). Initialize switches the
+	 *  articulation to Chaos (SwitchToChaos, in the robot's URammsMjSimControlComponent InitialKeyframe
+	 *  when it has one) and fails for a robot with no articulation, so the base falls back. */
+	explicit FRammsArticulationActuationBackend(bool bInSwitchToChaos = false)
+		: bSwitchToChaos(bInSwitchToChaos) {}
+
 	virtual bool   Initialize(URammsRobotBaseComponent& Base) override;
 	virtual void   SetCommand(FName MotorId, float Value) override { Active().SetCommand(MotorId, Value); }
 	virtual float  GetValue(FName MotorId) const override { return Active().GetValue(MotorId); }
@@ -81,5 +87,6 @@ private:
 	FRammsMujocoActuationBackend   Mujoco;
 	FRammsChaosArticulationBackend Chaos;
 	FString						   OwnerName;
+	bool						   bSwitchToChaos = false;
 	mutable TOptional<bool>		   bWasChaos; // for logging the engine once, and again on a switch
 };

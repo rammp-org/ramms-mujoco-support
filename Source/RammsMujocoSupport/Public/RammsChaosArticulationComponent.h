@@ -260,6 +260,11 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
 	bool IsBuilt() const { return bBuilt; }
 
+	/** Build now if bSimulateWithChaos is on, play has begun and no build has failed (BeginPlay and the
+	 *  first tick after the flag is turned on do this anyway). True when built. */
+	UFUNCTION(BlueprintCallable, Category = "Chaos Articulation")
+	bool EnsureBuilt();
+
 	/** The Chaos body a MuJoCo body moves with (its welded group's root), or null. */
 	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
 	URammsChaosBodyComponent* GetBodyComponent(FName MuJoCoBody) const;
