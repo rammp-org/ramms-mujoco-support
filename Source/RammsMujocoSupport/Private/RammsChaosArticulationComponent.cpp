@@ -351,15 +351,26 @@ URammsChaosArticulationComponent* URammsChaosArticulationComponent::SwitchToChao
 void URammsChaosArticulationComponent::BeginPlay()
 {
 	Super::BeginPlay();
-	if (!bSimulateWithChaos)
+	EnsureBuilt();
+}
+
+bool URammsChaosArticulationComponent::EnsureBuilt()
+{
+	if (bBuilt)
 	{
-		return;
+		return true;
+	}
+	if (!bSimulateWithChaos || !HasBegunPlay() || !BuildError.IsEmpty())
+	{
+		return false; // off, not playing yet (BeginPlay builds), or failed already
 	}
 	if (!Build(BuildError))
 	{
 		UE_LOG(LogRammsChaosArticulation, Error, TEXT("%s: Chaos build failed: %s"), *GetNameSafe(GetOwner()), *BuildError);
 		Teardown();
+		return false;
 	}
+	return true;
 }
 
 void URammsChaosArticulationComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -1750,7 +1761,7 @@ void URammsChaosArticulationComponent::SyncVisuals()
 void URammsChaosArticulationComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-	if (bBuilt)
+	if (bBuilt || EnsureBuilt()) // turned on after BeginPlay
 	{
 		SyncVisuals();
 	}

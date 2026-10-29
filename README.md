@@ -41,11 +41,14 @@ game-thread transforms a step or more behind), with an unlimited hinge (a wheel)
 
 ### Robot controllers on Chaos
 
-RammsMujocoSupport registers RammsCore's MuJoCo actuation backend; for a URLab articulation it drives
-whichever engine simulates it. While the articulation carries an active
-`URammsChaosArticulationComponent` (in its Blueprint, or added by `SwitchToChaos` at runtime), the
-robot base component's motors go to the Chaos component, so the robot's controllers, control surface
-and input maps work unchanged:
+To run a robot on Chaos, set its robot base component's **Backend** to **Chaos**. RammsMujocoSupport
+registers RammsCore's Chaos articulation backend, which switches the robot's URLab articulation to
+Chaos at BeginPlay (`SwitchToChaos`, starting in its `URammsMjSimControlComponent::InitialKeyframe`
+when it has one) and drives it. A robot with no articulation falls back to RammsCore's deprecated
+skeletal Chaos backend. **MuJoCo** and **Auto** drive the articulation on whichever engine simulates
+it: on Chaos while it carries an active `URammsChaosArticulationComponent` (in its Blueprint, or added
+by `SwitchToChaos` at runtime), on MuJoCo otherwise. Either way the robot's controllers, control
+surface and input maps work unchanged:
 
 | `IRammsActuationBackend` | on Chaos |
 |---|---|

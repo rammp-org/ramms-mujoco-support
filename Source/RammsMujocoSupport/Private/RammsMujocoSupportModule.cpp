@@ -18,11 +18,14 @@ public:
 	{
 		RammsActuationBackends::RegisterMujocoFactory(
 			FRammsActuationBackendFactory::CreateStatic(&FRammsMujocoSupportModule::CreateMujocoBackend));
+		RammsActuationBackends::RegisterChaosArticulationFactory(
+			FRammsActuationBackendFactory::CreateStatic(&FRammsMujocoSupportModule::CreateChaosArticulationBackend));
 	}
 
 	virtual void ShutdownModule() override
 	{
 		RammsActuationBackends::UnregisterMujocoFactory();
+		RammsActuationBackends::UnregisterChaosArticulationFactory();
 	}
 
 private:
@@ -33,6 +36,12 @@ private:
 		// It drives the articulation on MuJoCo, or on Chaos when the articulation
 		// carries a URammsChaosArticulationComponent.
 		return new FRammsArticulationActuationBackend();
+	}
+
+	static IRammsActuationBackend* CreateChaosArticulationBackend(URammsRobotBaseComponent& /*Base*/)
+	{
+		// Backend = Chaos: the same backend, but it switches the articulation to Chaos first.
+		return new FRammsArticulationActuationBackend(/*bSwitchToChaos=*/true);
 	}
 };
 

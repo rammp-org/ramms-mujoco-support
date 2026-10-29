@@ -5,6 +5,7 @@
 #include "GameFramework/Actor.h"
 #include "MuJoCo/Core/MjArticulation.h"
 #include "RammsChaosArticulationComponent.h"
+#include "RammsMjSimControlComponent.h"
 #include "RammsRobotBaseComponent.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogRammsArticulationBackend, Log, All);
@@ -142,6 +143,28 @@ bool FRammsArticulationActuationBackend::Initialize(URammsRobotBaseComponent& Ba
 	bWasChaos.Reset();
 	const bool bMujoco = Mujoco.Initialize(Base);
 	Chaos.Initialize(Base);
+	if (bMujoco && bSwitchToChaos)
+	{
+		AMjArticulation*				  Art = FRammsMujocoActuationBackend::FindArticulation(Base);
+		URammsChaosArticulationComponent* Comp = Art ? Art->FindComponentByClass<URammsChaosArticulationComponent>() : nullptr;
+		if (!Comp)
+		{
+			// Start in the keyframe the robot would start in on MuJoCo.
+			const URammsMjSimControlComponent* Sim = Base.GetOwner()->FindComponentByClass<URammsMjSimControlComponent>();
+			Comp = URammsChaosArticulationComponent::SwitchToChaos(Art, Sim ? Sim->InitialKeyframe : FString());
+		}
+		else if (!Comp->bSimulateWithChaos)
+		{
+			Comp->bSimulateWithChaos = true; // Backend = Chaos asks for it
+			Comp->EnsureBuilt();
+		}
+		if (!Comp || !Comp->GetBuildError().IsEmpty())
+		{
+			UE_LOG(LogRammsArticulationBackend, Error, TEXT("%s: Backend = Chaos, but its articulation could not be built on Chaos: %s"),
+				*OwnerName, Comp ? *Comp->GetBuildError() : TEXT("no articulation component"));
+			return false;
+		}
+	}
 	return bMujoco; // both resolve the same articulation, or neither does
 }
 
