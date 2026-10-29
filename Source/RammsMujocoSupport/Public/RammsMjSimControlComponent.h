@@ -29,6 +29,13 @@ class RAMMSMUJOCOSUPPORT_API URammsMjSimControlComponent : public UActorComponen
 	GENERATED_BODY()
 
 public:
+	/** A keyframe of the owning articulation's MJCF the robot is put in once
+	 *  the scene has compiled (AMjArticulation::ResetToKeyframe: the joints
+	 *  only, the world pose stays): spawned in its model's zero pose and then
+	 *  driven to its stance it would lurch; empty, nothing is applied. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ramms|Sim Control")
+	FString InitialKeyframe;
+
 	/** Steps StepSync runs for sim.step. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ramms|Sim Control", meta = (ClampMin = "1"))
 	int32 StepCount = 1;
@@ -40,6 +47,15 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Ramms|Sim Control")
 	AAMjManager* GetManager() const;
 
+	virtual void BeginPlay() override;
+
+protected:
+	/** Puts the owner in InitialKeyframe; false until the scene has compiled. */
+	bool  ApplyInitialKeyframe();
+	void  RetryInitialKeyframe();
+	int32 InitialKeyframeTries = 0;
+
+public:
 	// --- IRammsControlContributor: "sim.*" ------------------------------------
 	virtual void  DescribeControls(FRammsControlSurface& OutSurface) const override;
 	virtual bool  ApplyControl(FName Id, float Value) override;
