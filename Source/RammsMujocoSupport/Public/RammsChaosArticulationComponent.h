@@ -21,7 +21,8 @@ UENUM(BlueprintType)
 enum class ERammsChaosSelfCollision : uint8
 {
 	/** MuJoCo's rules: parts joined by a joint never collide, nor do <exclude>d pairs or pairs whose
-	 *  contype/conaffinity masks cannot meet. Everything else does. */
+	 *  contype/conaffinity masks cannot meet. Everything else does. When that leaves no pair that can
+	 *  collide (the usual robot MJCF), this is Off. */
 	MuJoCo,
 	/** No part collides with another part of the same articulation (the RAMMS RobotSelf convention:
 	 *  every part goes on SelfCollisionChannel and ignores it, so two such articulations ignore each
@@ -68,7 +69,7 @@ public:
  *  - a constraint per hinge, slide or ball joint, with its range (asymmetric ranges are centred by the
  *    constraint frames), and per <connect> equality (which closes kinematic loops);
  *  - a position + velocity drive per position servo (<position>, or a <general> with an affine bias),
- *    in force mode with the MJCF's kp / kv, and the force limit scaled by ServoForceLimitScale;
+ *    in force mode with the MJCF's kp / kv and force range;
  *  - a physics-rate callback that applies torque motors, joint damping, stiffness and friction loss,
  *    which Chaos constraint drives do not carry.
  *
@@ -79,9 +80,13 @@ public:
  * The level must not also hold an AAMjManager simulating this articulation (it would compile it into
  * MuJoCo too and move its bodies); this is reported at BeginPlay.
  *
+ * A robot base component on the articulation drives it through the same component (see
+ * FRammsChaosArticulationBackend): SetVelocityDrive and SetMotorBrake are its speed loop and brake.
+ *
  * Not carried: soft contacts and soft limits (Chaos limits and contacts are hard), torsional / rolling
- * friction, joint armature, spatial tendons, joint equalities, multi-joint bodies (only the first
- * joint is kept), and geoms that exist only in the compiled model (no visuals follow them).
+ * friction, spatial tendons, joint equalities, multi-joint bodies (only the first joint is kept), and
+ * geoms that exist only in the compiled model (no visuals follow them). Armature is added to the
+ * child's inertia about the hinge axis.
  */
 UCLASS(ClassGroup = (Ramms), meta = (BlueprintSpawnableComponent))
 class RAMMSMUJOCOSUPPORT_API URammsChaosArticulationComponent : public UActorComponent
@@ -102,17 +107,34 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation")
 	ERammsChaosSelfCollision SelfCollision = ERammsChaosSelfCollision::MuJoCo;
 
-	/** The object channel the parts use when SelfCollision is Off (RAMMS' RobotSelf). */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation", meta = (EditCondition = "SelfCollision == ERammsChaosSelfCollision::Off"))
+	/** The object channel the parts use when SelfCollision is Off, or MuJoCo's rules leave no pair that
+	 *  can collide (RAMMS' RobotSelf). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation")
 	TEnumAsByte<ECollisionChannel> SelfCollisionChannel = ECC_GameTraceChannel2;
 
-	/**
-	 * Multiplier on a servo's MJCF force range when it becomes a drive's force limit. Chaos' drive
-	 * limit does not carry over 1:1: a lift-drive base's stance servos, which MuJoCo holds with 10-30
-	 * N.m against a 207 N.m range, did not move at 1x and did at 10x.
-	 */
+	/** Multiplier on a servo's MJCF force range when it becomes its drive's force limit. 1 carries it
+	 *  over: with the solver iterations below, a Gen3 shoulder saturated at its 105 N.m range reaches its
+	 *  target as fast as on MuJoCo. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation", meta = (ClampMin = "0.1"))
-	float ServoForceLimitScale = 10.0f;
+	float ServoForceLimitScale = 1.0f;
+
+	/**
+	 * Position / velocity solver iterations for the articulation's bodies (0: the project's, 8 / 1). A
+	 * drive is only as stiff as the iterations let it converge along a chain: at the project's a Gen3
+	 * arm's shoulder sags ten times what its kp gives on MuJoCo (0.07 rad against 0.007), and still
+	 * 2.5x at 32 / 4. 64 / 8 brings it to 1.5x and its step response to MuJoCo's. The island takes the
+	 * most any body in it asks for.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation", meta = (ClampMin = "0", ClampMax = "255"))
+	int32 SolverPositionIterations = 64;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation", meta = (ClampMin = "0", ClampMax = "255"))
+	int32 SolverVelocityIterations = 8;
+
+	/** Chaos' joint mass conditioning: it evens out the inertia of a heavy and a light body a joint
+	 *  connects, trading a drive's accuracy for stability. Off halves the Gen3 shoulder's sag. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation")
+	bool bJointMassConditioning = false;
 
 	/** Sides of the convex polygon a cylinder geom (a wheel) becomes; Chaos has no cylinder. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation", meta = (ClampMin = "8", ClampMax = "128"))
@@ -137,7 +159,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Chaos Articulation", meta = (DefaultToSelf = "Articulation"))
 	static URammsChaosArticulationComponent* SwitchToChaos(AActor* Articulation, const FString& Keyframe);
 
-	/** Set an actuator's control, in its MJCF ctrl units (clamped to ctrlrange). False: no such actuator. */
+	/** Set an actuator's control, in its MJCF ctrl units (clamped to ctrlrange). False: no such actuator.
+	 *  Before the articulation is built (another component's BeginPlay can run first) the value is kept
+	 *  and applied once it is, over the initial keyframe's; true then means only that it was kept. A
+	 *  released servo takes hold again. */
 	UFUNCTION(BlueprintCallable, Category = "Chaos Articulation")
 	bool SetControl(FName Actuator, float Value);
 
@@ -148,8 +173,8 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Chaos Articulation")
 	bool SetJointForce(FName Joint, float Force);
 
-	/** A joint's coordinate (rad, or m for a slide, as MuJoCo reports it), measured from the bodies. An
-	 *  unlimited hinge (a wheel) keeps counting past +-pi, as MuJoCo's qpos does. */
+	/** A joint's coordinate (rad, or m for a slide, as MuJoCo reports it), as of the latest physics step.
+	 *  An unlimited hinge (a wheel) keeps counting past +-pi, as MuJoCo's qpos does. */
 	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
 	float GetJointPosition(FName Joint) const;
 
@@ -189,6 +214,48 @@ public:
 	/** Whether an actuator is a torque motor (false: a position or velocity servo, or unknown). */
 	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
 	bool IsMotor(FName Actuator) const;
+
+	/** The joint an actuator drives (the first, for a tendon across several), or None. */
+	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
+	FName GetActuatorJoint(FName Actuator) const;
+
+	/** World transform of the MuJoCo body a joint moves (as URLab's body component would have it). */
+	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
+	bool GetJointBodyTransform(FName Joint, FTransform& OutWorld) const;
+
+	/**
+	 * Let go of an actuator: a servo's constraint drives are switched off (the joint swings free until
+	 * the next SetControl), a motor's control goes to zero. False: no such actuator.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Chaos Articulation")
+	bool ReleaseActuator(FName Actuator);
+
+	/**
+	 * Engage or release a torque motor's parking brake: its joint held where it stands by the joint
+	 * constraint's own drive, as far as the motor's torque goes (its force range, else its control range
+	 * times its gain). Engaging stops any SetVelocityDrive loop. False: not built, or not a motor.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Chaos Articulation")
+	bool SetMotorBrake(FName Actuator, bool bEngaged);
+
+	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
+	bool IsMotorBraked(FName Actuator) const;
+
+	/**
+	 * Hold a torque motor's joint at TargetRate with a PI loop, its output the motor's control (clamped
+	 * to [OutMin, OutMax] when min < max, then to the actuator's force range), the integral capped at
+	 * +-MaxIntegral (when positive) and held while the output saturates. The rate is measured on the
+	 * actuator's (first) joint in MJCF units times RateScale: 100 lets a caller work in cm/s on a slide.
+	 * A retune (new gains) restarts the integral. Call it every frame: the proportional term is the joint
+	 * constraint's velocity drive, solved with the bodies, and the integral moves that drive's target
+	 * once a frame. (A tendon or reversed motor runs the whole loop in the physics-rate callback.)
+	 * False: not built, or not a motor.
+	 */
+	bool SetVelocityDrive(FName Actuator, double TargetRate, double Kp, double Ki, double MaxIntegral,
+		double OutMin, double OutMax, double RateScale = 1.0);
+
+	/** Stop a SetVelocityDrive loop; the motor keeps the control it last produced until set again. */
+	void ClearVelocityDrive(FName Actuator);
 
 	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
 	bool IsBuilt() const { return bBuilt; }
@@ -238,6 +305,7 @@ private:
 	{
 		FName	   Name;
 		EJointKind Kind = EJointKind::Hinge;
+		int32	   Body = INDEX_NONE; // the MuJoCo body it moves
 		int32	   ParentRoot = INDEX_NONE;
 		int32	   ChildRoot = INDEX_NONE;
 		FVector	   AxisInParent = FVector::XAxisVector;									// unit, parent root frame
@@ -247,7 +315,6 @@ private:
 		int32	   Constraint = INDEX_NONE;												// into Constraints
 		double	   Damping = 0.0, Stiffness = 0.0, SpringRef = 0.0, FrictionLoss = 0.0; // MJCF units
 		bool	   bContinuous = false;													// an unlimited hinge (a wheel): its angle is counted past +-pi
-		double	   Unwrapped = 0.0, LastWrapped = 0.0;
 	};
 
 	struct FActuator
@@ -261,15 +328,27 @@ private:
 		bool						 bForceLimited = false;
 		double						 ForceMin = 0.0, ForceMax = 0.0;
 		float						 Ctrl = 0.0f;
+		bool						 bReleased = false;		 // a servo whose drives ReleaseActuator switched off
+		bool						 bVelocityDrive = false; // SetVelocityDrive's loop owns the control
+		bool						 bBraked = false;		 // SetMotorBrake holds its joint
+		struct
+		{
+			bool   bImplicit = false; // on the joint constraint's velocity drive (else the callback's loop)
+			double Target = 0.0, Kp = 0.0, Ki = 0.0, MaxIntegral = 0.0;
+			double Integral = 0.0, LastCtrl = 0.0, Time = -1.0;
+		} Loop; // SetVelocityDrive
 	};
 
-	bool Build(FString& OutError);
-	void Teardown();
-	void ApplyActuator(int32 Index);
-	void PushEfforts();
-	void WakeRoots(int32 A, int32 B);
-	bool MeasureJoint(const FJoint& J, double& OutQ, double& OutQd) const;
-	void SyncVisuals();
+	bool   Build(FString& OutError);
+	void   Teardown();
+	void   ApplyActuator(int32 Index);
+	void   SetServoDrivesEnabled(int32 Index, bool bEnabled);
+	double MotorTorqueLimit(const FActuator& Act) const; // N.m (or N) at its first joint; 0: unlimited
+	void   PushEfforts();
+	void   WakeRoots(int32 A, int32 B);
+	bool   MeasureJoint(const FJoint& J, double& OutQ, double& OutQd) const;
+	bool   ReadJoint(int32 Index, double& OutQ, double& OutQd) const; // MJCF units, from the latest step
+	void   SyncVisuals();
 
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<URammsChaosBodyComponent>> Roots;
@@ -285,6 +364,7 @@ private:
 	TArray<TUniquePtr<FConstraintInstance>> Constraints;
 	TArray<double>							ExternalForce; // per joint, MJCF units
 	TMap<FString, TArray<float>>			KeyframeCtrl;
+	TMap<FName, float>						PendingCtrl; // SetControl before the build
 
 	FRammsChaosArticulationCallback* Callback = nullptr;
 	bool							 bBuilt = false;

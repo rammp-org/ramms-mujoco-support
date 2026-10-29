@@ -3,7 +3,7 @@
 #include "Modules/ModuleManager.h"
 #include "RammsActuationBackend.h"
 #include "RammsActuationBackendRegistry.h"
-#include "RammsMujocoActuationBackend.h"
+#include "RammsArticulationActuationBackend.h"
 
 /**
  * RammsMujocoSupport module. On startup it registers the MuJoCo actuation-backend
@@ -30,7 +30,9 @@ private:
 	{
 		// Constructed only; the base component calls Initialize and frees it (and
 		// leaves itself backend-less if Initialize can't resolve an articulation).
-		return new FRammsMujocoActuationBackend();
+		// It drives the articulation on MuJoCo, or on Chaos when the articulation
+		// carries a URammsChaosArticulationComponent.
+		return new FRammsArticulationActuationBackend();
 	}
 };
 

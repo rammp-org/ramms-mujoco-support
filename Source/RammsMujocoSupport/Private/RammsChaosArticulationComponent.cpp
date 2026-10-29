@@ -48,10 +48,30 @@ public:
 		// Unreal units: kg.cm^2/s^2 per rad (hinge) or kg/s^2 (slide), and so on.
 		double Damping = 0.0, Stiffness = 0.0, SpringRef = 0.0, FrictionLoss = 0.0;
 		double Effort = 0.0;
+		// The joint as of the latest step, for the game thread's reads: fresher than the bodies' game-
+		// thread transforms, which async physics interpolates a step or more behind. A hinge's angle is
+		// counted on past +-pi here, where no step turns it half a revolution.
+		bool   bMeasured = false;
+		double Q = 0.0, Counted = 0.0, Qd = 0.0;
 	};
 
-	FCriticalSection Lock;
-	TArray<FPtJoint> Joints;
+	/** A torque motor's speed loop (SetVelocityDrive), its output the motor's control. */
+	struct FPtDrive
+	{
+		int32						 Joint = INDEX_NONE; // the joint whose rate it measures
+		TArray<TPair<int32, double>> Out;				 // (joint, coefficient x gear) the force goes to
+		double						 Gain = 1.0, Bias0 = 0.0;
+		bool						 bForceLimited = false;
+		double						 ForceMin = 0.0, ForceMax = 0.0;
+		double						 RateScale = 1.0; // caller's rate units per MJCF unit
+		double						 Target = 0.0, Kp = 0.0, Ki = 0.0, MaxIntegral = 0.0, OutMin = 0.0, OutMax = 0.0;
+		double						 Integral = 0.0, LastCtrl = 0.0;
+	};
+
+	FCriticalSection	  Lock;
+	TArray<FPtJoint>	  Joints;
+	TMap<FName, FPtDrive> Drives;
+	TArray<double>		  DriveEffort; // per joint, this step (Unreal units)
 
 	virtual FName GetFNameForStatId() const override
 	{
@@ -59,36 +79,107 @@ public:
 		return Name;
 	}
 
-	virtual void OnPreSimulate_Internal() override
+	/** A joint's coordinate and rate (rad, rad/s; cm, cm/s on a slide) and its world axis. */
+	static bool Measure(const FPtJoint& J, double& Q, double& Qd, FVector& Axis)
 	{
-		FScopeLock Guard(&Lock);
-		for (const FPtJoint& J : Joints)
+		Chaos::FRigidBodyHandle_Internal* C = J.Child ? J.Child->GetPhysicsThreadAPI() : nullptr;
+		if (C == nullptr)
 		{
-			Chaos::FRigidBodyHandle_Internal* C = J.Child ? J.Child->GetPhysicsThreadAPI() : nullptr;
-			if (C == nullptr)
+			return false;
+		}
+		Chaos::FRigidBodyHandle_Internal* P = J.Parent ? J.Parent->GetPhysicsThreadAPI() : nullptr;
+		const FQuat						  Rp = P ? FQuat(P->R()) : J.StaticParent.GetRotation();
+		const FVector					  Xp = P ? FVector(P->X()) : J.StaticParent.GetLocation();
+		const FVector					  Wp = P ? FVector(P->W()) : FVector::ZeroVector;
+		const FVector					  Vp = P ? FVector(P->V()) : FVector::ZeroVector;
+		Axis = Rp.RotateVector(J.AxisInParent);
+		if (J.bHinge)
+		{
+			const FQuat D = (Rp.Inverse() * FQuat(C->R())) * J.Rel0.Inverse();
+			Q = FMath::UnwindRadians(2.0 * FMath::Atan2(FVector(D.X, D.Y, D.Z) | J.AxisInParent, D.W));
+			Qd = (FVector(C->W()) - Wp) | Axis;
+		}
+		else
+		{
+			Q = (Rp.UnrotateVector(FVector(C->X()) - Xp) - J.Origin0) | J.AxisInParent;
+			Qd = (FVector(C->V()) - Vp) | Axis;
+		}
+		return true;
+	}
+
+	/** The speed loops, the same PI the robot base runs: integral capped, and held while the output is
+	 *  saturated so it does not wind up. Their forces land in DriveEffort. */
+	void StepDrives()
+	{
+		DriveEffort.SetNumUninitialized(Joints.Num());
+		for (double& E : DriveEffort)
+		{
+			E = 0.0;
+		}
+		const double Dt = GetDeltaTime_Internal();
+		for (TPair<FName, FPtDrive>& Pair : Drives)
+		{
+			FPtDrive& D = Pair.Value;
+			double	  Q = 0.0, Qd = 0.0;
+			FVector	  Axis;
+			if (!Joints.IsValidIndex(D.Joint) || !Measure(Joints[D.Joint], Q, Qd, Axis))
 			{
 				continue;
 			}
-			Chaos::FRigidBodyHandle_Internal* P = J.Parent ? J.Parent->GetPhysicsThreadAPI() : nullptr;
-			const FQuat						  Rp = P ? FQuat(P->R()) : J.StaticParent.GetRotation();
-			const FVector					  Xp = P ? FVector(P->X()) : J.StaticParent.GetLocation();
-			const FVector					  Wp = P ? FVector(P->W()) : FVector::ZeroVector;
-			const FVector					  Vp = P ? FVector(P->V()) : FVector::ZeroVector;
-			const FVector					  Axis = Rp.RotateVector(J.AxisInParent);
+			const double Rate = (Joints[D.Joint].bHinge ? Qd : Qd * 0.01) * D.RateScale;
+			const double Error = D.Target - Rate;
+			double		 Integral = D.Integral + D.Ki * Error * Dt;
+			if (D.MaxIntegral > 0.0)
+			{
+				Integral = FMath::Clamp(Integral, -D.MaxIntegral, D.MaxIntegral);
+			}
+			double Ctrl = D.Kp * Error + Integral;
+			if (D.OutMin < D.OutMax)
+			{
+				const double Clamped = FMath::Clamp(Ctrl, D.OutMin, D.OutMax);
+				if (Clamped != Ctrl)
+				{
+					Integral = D.Integral;
+				}
+				Ctrl = Clamped;
+			}
+			D.Integral = Integral;
+			D.LastCtrl = Ctrl;
+			double F = D.Gain * Ctrl + D.Bias0;
+			if (D.bForceLimited)
+			{
+				F = FMath::Clamp(F, D.ForceMin, D.ForceMax);
+			}
+			for (const TPair<int32, double>& O : D.Out)
+			{
+				if (DriveEffort.IsValidIndex(O.Key))
+				{
+					DriveEffort[O.Key] += F * O.Value * (Joints[O.Key].bHinge ? 1.0e4 : 100.0);
+				}
+			}
+		}
+	}
 
-			double Q = 0.0, Qd = 0.0;
-			if (J.bHinge)
+	virtual void OnPreSimulate_Internal() override
+	{
+		FScopeLock Guard(&Lock);
+		StepDrives();
+		for (int32 j = 0; j < Joints.Num(); ++j)
+		{
+			FPtJoint& J = Joints[j];
+			double	  Q = 0.0, Qd = 0.0;
+			FVector	  Axis;
+			if (!Measure(J, Q, Qd, Axis))
 			{
-				const FQuat D = (Rp.Inverse() * FQuat(C->R())) * J.Rel0.Inverse();
-				Q = FMath::UnwindRadians(2.0 * FMath::Atan2(FVector(D.X, D.Y, D.Z) | J.AxisInParent, D.W));
-				Qd = (FVector(C->W()) - Wp) | Axis;
+				continue;
 			}
-			else
-			{
-				Q = (Rp.UnrotateVector(FVector(C->X()) - Xp) - J.Origin0) | J.AxisInParent;
-				Qd = (FVector(C->V()) - Vp) | Axis;
-			}
-			double Tau = J.Effort - J.Damping * Qd - J.Stiffness * (Q - J.SpringRef);
+			J.Counted = (J.bMeasured && J.bHinge) ? J.Counted + FMath::UnwindRadians(Q - J.Q) : Q;
+			J.Q = Q;
+			J.Qd = Qd;
+			J.bMeasured = true;
+			Chaos::FRigidBodyHandle_Internal* C = J.Child->GetPhysicsThreadAPI();
+			Chaos::FRigidBodyHandle_Internal* P = J.Parent ? J.Parent->GetPhysicsThreadAPI() : nullptr;
+			double							  Tau = J.Effort + DriveEffort[j] - J.Damping * Qd - J.Stiffness * (Q - J.SpringRef);
 			if (J.FrictionLoss > 0.0)
 			{
 				Tau -= J.FrictionLoss * FMath::Clamp(Qd / (J.bHinge ? 0.01 : 0.1), -1.0, 1.0);
@@ -534,6 +625,14 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 		}
 		Comp->BodyInstance.bSimulatePhysics = bDynamic;
 		Comp->BodyInstance.SetUseCCD(false);
+		if (SolverPositionIterations > 0 || SolverVelocityIterations > 0)
+		{
+			// The island takes the most any of its bodies asks for.
+			Comp->BodyInstance.SetOverrideIterationCounts(true);
+			Comp->BodyInstance.SetPositionSolverIterationCount((uint8)FMath::Clamp(SolverPositionIterations > 0 ? SolverPositionIterations : 8, 1, 255));
+			Comp->BodyInstance.SetVelocitySolverIterationCount((uint8)FMath::Clamp(SolverVelocityIterations > 0 ? SolverVelocityIterations : 1, 1, 255));
+			Comp->BodyInstance.SetProjectionSolverIterationCount(1);
+		}
 		// A moving body with no collision geom still needs a shape to carry its mass: a small sphere that
 		// collides with nothing.
 		if (bDynamic && Setup->AggGeom.GetElementCount() == 0)
@@ -617,6 +716,7 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 		const int32 Parent = RootOf[M->body_parentid[B]]; // INDEX_NONE: the world
 		FJoint		J;
 		J.Name = MjName(M, mjOBJ_JOINT, j);
+		J.Body = B;
 		J.Kind = Type == mjJNT_HINGE ? EJointKind::Hinge : Type == mjJNT_SLIDE ? EJointKind::Slide
 																			   : EJointKind::Ball;
 		J.ParentRoot = Parent;
@@ -676,6 +776,7 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 		CI->SetRefFrame(EConstraintFrame::Frame1, F1.GetRelativeTransform(ParentWorld0));
 		CI->SetRefFrame(EConstraintFrame::Frame2, F2.GetRelativeTransform(ChildWorld0));
 		FBodyInstance* P = Parent != INDEX_NONE ? &Roots[Parent]->BodyInstance : nullptr;
+		CI->ProfileInstance.bEnableMassConditioning = bJointMassConditioning;
 		CI->InitConstraint(P, &Roots[Child]->BodyInstance, 1.0f, Art);
 		J.Constraint = Constraints.Add(MoveTemp(CI));
 		JointByName.Add(J.Name, Joints.Add(J));
@@ -773,6 +874,21 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 					Wanted.Add(PairKey(ra, rb));
 				}
 			}
+		}
+		// The usual robot MJCF (contype 1, conaffinity 0 on every part) lets no two parts touch. Then the
+		// parts go on SelfCollisionChannel and ignore it, as SelfCollision Off does, instead of a
+		// constraint per pair: hundreds of them on a mobile base, and with stiff drives they disturb it.
+		const int32 Pairs = RootBody.Num() * (RootBody.Num() - 1) / 2;
+		if (Wanted.Union(Off).Num() >= Pairs)
+		{
+			for (URammsChaosBodyComponent* Comp : Roots)
+			{
+				Comp->SetCollisionObjectType(SelfCollisionChannel);
+				Comp->SetCollisionResponseToChannel(SelfCollisionChannel, ECR_Ignore);
+			}
+			Wanted.Reset();
+			UE_LOG(LogRammsChaosArticulation, Log, TEXT("%s: no two parts can collide by MuJoCo's rules: they ignore each other on channel %d"),
+				*Art->GetName(), (int32)SelfCollisionChannel.GetValue());
 		}
 		for (uint64 K : Wanted)
 		{
@@ -904,14 +1020,16 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 		}
 	}
 
-	// URLab's own visuals stay as queries only, so they never push the Chaos bodies.
+	// URLab's own components only show the robot: the Chaos bodies are its collision, for queries too.
+	// Without a physics state of their own they also follow the bodies every frame at a fraction of the
+	// cost (a query-only shape is moved in the physics scene each time).
 	TArray<UPrimitiveComponent*> Prims;
 	Art->GetComponents(Prims);
 	for (UPrimitiveComponent* Prim : Prims)
 	{
 		if (!Prim->IsA<URammsChaosBodyComponent>() && Prim->GetCollisionEnabled() != ECollisionEnabled::NoCollision)
 		{
-			Prim->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+			Prim->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 		}
 	}
 
@@ -927,6 +1045,14 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 			ApplyActuator(a);
 		}
 	}
+	for (const TPair<FName, float>& Pending : PendingCtrl)
+	{
+		if (!SetControl(Pending.Key, Pending.Value))
+		{
+			UE_LOG(LogRammsChaosArticulation, Warning, TEXT("%s: no actuator %s for a control set before the build"), *Art->GetName(), *Pending.Key.ToString());
+		}
+	}
+	PendingCtrl.Reset();
 	SyncVisuals();
 	UE_LOG(LogRammsChaosArticulation, Log, TEXT("%s: built on Chaos: %d bodies (%d MuJoCo), %d joints, %d constraints, %d actuators"),
 		*Art->GetName(), Roots.Num(), M->nbody - 1, Joints.Num(), Constraints.Num(), Actuators.Num());
@@ -1031,7 +1157,7 @@ void URammsChaosArticulationComponent::PushEfforts()
 	TArray<double> Effort = ExternalForce;
 	for (const FActuator& Act : Actuators)
 	{
-		if (Act.Kind != EActuatorKind::Motor)
+		if (Act.Kind != EActuatorKind::Motor || Act.bVelocityDrive) // a speed loop applies its own
 		{
 			continue;
 		}
@@ -1060,6 +1186,15 @@ void URammsChaosArticulationComponent::PushEfforts()
 
 bool URammsChaosArticulationComponent::SetControl(FName Actuator, float Value)
 {
+	if (!bBuilt)
+	{
+		if (bSimulateWithChaos && BuildError.IsEmpty())
+		{
+			PendingCtrl.Add(Actuator, Value);
+			return true;
+		}
+		return false;
+	}
 	const int32* Index = ActuatorByName.Find(Actuator);
 	if (!Index)
 	{
@@ -1067,7 +1202,338 @@ bool URammsChaosArticulationComponent::SetControl(FName Actuator, float Value)
 	}
 	FActuator& Act = Actuators[*Index];
 	Act.Ctrl = Act.bCtrlLimited ? FMath::Clamp(Value, (float)Act.CtrlMin, (float)Act.CtrlMax) : Value;
+	if (Act.bReleased)
+	{
+		Act.bReleased = false;
+		SetServoDrivesEnabled(*Index, true);
+	}
 	ApplyActuator(*Index);
+	return true;
+}
+
+void URammsChaosArticulationComponent::SetServoDrivesEnabled(int32 Index, bool bEnabled)
+{
+	const FActuator& Act = Actuators[Index];
+	const bool		 bPos = bEnabled && Act.Kind == EActuatorKind::PositionServo;
+	const bool		 bVel = bEnabled && Act.Kv > 0.0;
+	for (const TPair<int32, double>& JC : Act.Joints)
+	{
+		const FJoint&		 J = Joints[JC.Key];
+		FConstraintInstance& CI = *Constraints[J.Constraint];
+		if (J.Kind == EJointKind::Slide)
+		{
+			CI.SetLinearPositionDrive(bPos, false, false);
+			CI.SetLinearVelocityDrive(bVel, false, false);
+		}
+		else
+		{
+			CI.SetOrientationDriveTwistAndSwing(bPos, false);
+			CI.SetAngularVelocityDriveTwistAndSwing(bVel, false);
+		}
+		WakeRoots(J.ParentRoot, J.ChildRoot);
+	}
+}
+
+bool URammsChaosArticulationComponent::ReleaseActuator(FName Actuator)
+{
+	const int32* Index = bBuilt ? ActuatorByName.Find(Actuator) : nullptr;
+	if (!Index)
+	{
+		return false;
+	}
+	FActuator& Act = Actuators[*Index];
+	if (Act.Kind == EActuatorKind::Motor)
+	{
+		ClearVelocityDrive(Actuator);
+		Act.Ctrl = 0.0f;
+		PushEfforts();
+	}
+	else if (!Act.bReleased)
+	{
+		Act.bReleased = true;
+		SetServoDrivesEnabled(*Index, false);
+	}
+	return true;
+}
+
+bool URammsChaosArticulationComponent::SetVelocityDrive(FName Actuator, double TargetRate, double Kp, double Ki,
+	double MaxIntegral, double OutMin, double OutMax, double RateScale)
+{
+	const int32* Index = bBuilt && Callback ? ActuatorByName.Find(Actuator) : nullptr;
+	if (!Index)
+	{
+		return false;
+	}
+	FActuator& Act = Actuators[*Index];
+	if (Act.Kind != EActuatorKind::Motor || Act.Joints.Num() == 0)
+	{
+		return false;
+	}
+	if (Act.bBraked)
+	{
+		SetMotorBrake(Actuator, false); // the loop and the brake share the joint's drive
+	}
+	const bool bStarting = !Act.bVelocityDrive;
+	if (bStarting || Act.Loop.Kp != Kp || Act.Loop.Ki != Ki || Act.Loop.MaxIntegral != MaxIntegral)
+	{
+		Act.Loop.Integral = 0.0; // what the old gains accumulated means nothing under the new ones
+		Act.Loop.Time = -1.0;
+	}
+	const bool bWake = bStarting || Act.Loop.Target != TargetRate || TargetRate != 0.0;
+	Act.Loop.Target = TargetRate;
+	Act.Loop.Kp = Kp;
+	Act.Loop.Ki = Ki;
+	Act.Loop.MaxIntegral = MaxIntegral;
+
+	// A single-joint motor whose control pushes its joint forward runs on the joint constraint's velocity
+	// drive, which the solver applies implicitly: an explicit loop at Chaos' step (10 ms or more, against
+	// MuJoCo's 2) is unstable at the gains a wheel needs once the light link it hangs from is in the loop.
+	// The drive is the proportional term; the integral, updated here once a frame, shifts its target, so
+	// the drive's force limit clamps the sum as the base's loop clamps its output.
+	const FJoint& J0 = Joints[Act.Joints[0].Key];
+	const double  PerCtrl = Act.Gain * Act.Joints[0].Value; // joint force per unit of control
+	Act.Loop.bImplicit = Act.Joints.Num() == 1 && PerCtrl > 0.0 && Kp > 0.0 && J0.Kind != EJointKind::Ball;
+	if (Act.Loop.bImplicit)
+	{
+		{
+			FScopeLock Guard(&Callback->Lock);
+			Callback->Drives.Remove(Actuator);
+		}
+		double Q = 0.0, Qd = 0.0;
+		ReadJoint(Act.Joints[0].Key, Q, Qd);
+		const double Error = TargetRate - Qd * RateScale;
+		const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+		const double Dt = Act.Loop.Time >= 0.0 ? FMath::Clamp(Now - Act.Loop.Time, 0.0, 0.1) : 0.0;
+		Act.Loop.Time = Now;
+		double Integral = Act.Loop.Integral + Ki * Error * Dt;
+		if (MaxIntegral > 0.0)
+		{
+			Integral = FMath::Clamp(Integral, -MaxIntegral, MaxIntegral);
+		}
+		const double Output = Kp * Error + Integral;
+		if (OutMin < OutMax && (Output < OutMin || Output > OutMax))
+		{
+			Integral = Act.Loop.Integral; // saturated: hold, do not wind up
+		}
+		Act.Loop.Integral = Integral;
+		Act.Loop.LastCtrl = OutMin < OutMax ? FMath::Clamp(Output, OutMin, OutMax) : Output;
+
+		double Limit = OutMin < OutMax ? FMath::Max(FMath::Abs(OutMin), FMath::Abs(OutMax)) * PerCtrl : 0.0;
+		if (Act.bForceLimited)
+		{
+			const double Range = FMath::Max(FMath::Abs(Act.ForceMin), FMath::Abs(Act.ForceMax)) * Act.Joints[0].Value;
+			Limit = Limit > 0.0 ? FMath::Min(Limit, Range) : Range;
+		}
+		const double		 Damping = Kp * RateScale * PerCtrl;			  // N.m per rad/s, or N per m/s
+		const double		 Rate = (TargetRate + Integral / Kp) / RateScale; // MJCF units
+		FConstraintInstance& CI = *Constraints[J0.Constraint];
+		if (J0.Kind == EJointKind::Slide)
+		{
+			if (bStarting)
+			{
+				CI.SetLinearDriveAccelerationMode(false);
+				CI.SetLinearPositionDrive(false, false, false);
+				CI.SetLinearVelocityDrive(true, false, false);
+			}
+			CI.SetLinearDriveParams(0.0f, Damping, Limit > 0.0 ? Limit * 100.0 : 0.0);
+			CI.SetLinearVelocityTarget(FVector(Rate * 100.0, 0.0, 0.0));
+		}
+		else
+		{
+			if (bStarting)
+			{
+				CI.SetAngularDriveAccelerationMode(false);
+				CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
+				CI.SetOrientationDriveTwistAndSwing(false, false);
+				CI.SetAngularVelocityDriveTwistAndSwing(true, false);
+			}
+			CI.SetAngularDriveParams(0.0f, Damping * 1.0e4, Limit > 0.0 ? Limit * 1.0e4 : 0.0);
+			CI.SetAngularVelocityTarget(FVector(-Rate / (2.0 * UE_DOUBLE_PI), 0.0, 0.0)); // rev/s, the drive's sense
+		}
+	}
+	else
+	{
+		// Anything else (a tendon motor, a reversed gear, a pure integral loop) runs explicitly in the
+		// physics-rate callback.
+		FScopeLock								   Guard(&Callback->Lock);
+		FRammsChaosArticulationCallback::FPtDrive& D = Callback->Drives.FindOrAdd(Actuator);
+		if (D.Joint == INDEX_NONE)
+		{
+			D.Joint = Act.Joints[0].Key;
+			D.Out = Act.Joints;
+			D.Gain = Act.Gain;
+			D.Bias0 = Act.Bias0;
+			D.bForceLimited = Act.bForceLimited;
+			D.ForceMin = Act.ForceMin;
+			D.ForceMax = Act.ForceMax;
+		}
+		if (D.Kp != Kp || D.Ki != Ki || D.MaxIntegral != MaxIntegral)
+		{
+			D.Integral = 0.0;
+		}
+		D.RateScale = RateScale;
+		D.Target = TargetRate;
+		D.Kp = Kp;
+		D.Ki = Ki;
+		D.MaxIntegral = MaxIntegral;
+		D.OutMin = OutMin;
+		D.OutMax = OutMax;
+	}
+	if (bStarting)
+	{
+		Act.bVelocityDrive = true;
+		PushEfforts(); // its control no longer counts: the loop's does
+	}
+	if (bWake)
+	{
+		for (const TPair<int32, double>& JC : Act.Joints)
+		{
+			WakeRoots(Joints[JC.Key].ParentRoot, Joints[JC.Key].ChildRoot);
+		}
+	}
+	return true;
+}
+
+void URammsChaosArticulationComponent::ClearVelocityDrive(FName Actuator)
+{
+	const int32* Index = ActuatorByName.Find(Actuator);
+	if (!Index || !Callback)
+	{
+		return;
+	}
+	FActuator& Act = Actuators[*Index];
+	double	   Last = Act.Loop.bImplicit ? Act.Loop.LastCtrl : Act.Ctrl;
+	{
+		FScopeLock Guard(&Callback->Lock);
+		if (const FRammsChaosArticulationCallback::FPtDrive* D = Callback->Drives.Find(Actuator))
+		{
+			Last = D->LastCtrl;
+			Callback->Drives.Remove(Actuator);
+		}
+	}
+	if (Act.bVelocityDrive)
+	{
+		for (const TPair<int32, double>& JC : Act.Joints)
+		{
+			FConstraintInstance& CI = *Constraints[Joints[JC.Key].Constraint];
+			if (Joints[JC.Key].Kind == EJointKind::Slide)
+			{
+				CI.SetLinearVelocityDrive(false, false, false);
+			}
+			else
+			{
+				CI.SetAngularVelocityDriveTwistAndSwing(false, false);
+			}
+		}
+		// The motor keeps what the loop last asked of it, as a MuJoCo actuator keeps its staged control.
+		Act.bVelocityDrive = false;
+		Act.Loop.bImplicit = false;
+		Act.Ctrl = (float)Last;
+		PushEfforts();
+	}
+}
+
+double URammsChaosArticulationComponent::MotorTorqueLimit(const FActuator& Act) const
+{
+	const double Coef = Act.Joints.Num() > 0 ? FMath::Abs(Act.Joints[0].Value) : 1.0;
+	if (Act.bForceLimited)
+	{
+		return FMath::Max(FMath::Abs(Act.ForceMin), FMath::Abs(Act.ForceMax)) * Coef;
+	}
+	if (Act.bCtrlLimited)
+	{
+		return FMath::Max(FMath::Abs(Act.CtrlMin), FMath::Abs(Act.CtrlMax)) * FMath::Abs(Act.Gain) * Coef;
+	}
+	return 0.0;
+}
+
+bool URammsChaosArticulationComponent::SetMotorBrake(FName Actuator, bool bEngaged)
+{
+	const int32* Index = bBuilt ? ActuatorByName.Find(Actuator) : nullptr;
+	if (!Index || Actuators[*Index].Kind != EActuatorKind::Motor || Actuators[*Index].Joints.Num() != 1)
+	{
+		return false;
+	}
+	FActuator& Act = Actuators[*Index];
+	if (bEngaged == Act.bBraked)
+	{
+		return true; // an engaged brake keeps the angle it was set at
+	}
+	const FJoint&		 J = Joints[Act.Joints[0].Key];
+	FConstraintInstance& CI = *Constraints[J.Constraint];
+	if (J.Kind == EJointKind::Ball)
+	{
+		return false;
+	}
+	if (bEngaged)
+	{
+		ClearVelocityDrive(Actuator);
+		// Full torque about a degree (or a millimetre) off, critically damped-ish; held by the solver, so
+		// stable at any stiffness. The limit is what the motor can do: a steeper slope rolls the robot.
+		double		 Q = 0.0, Qd = 0.0;
+		const double Limit = MotorTorqueLimit(Act);
+		ReadJoint(Act.Joints[0].Key, Q, Qd);
+		const double Most = Limit > 0.0 ? Limit : 1000.0;
+		if (J.Kind == EJointKind::Slide)
+		{
+			CI.SetLinearDriveAccelerationMode(false);
+			CI.SetLinearPositionDrive(true, false, false);
+			CI.SetLinearVelocityDrive(true, false, false);
+			CI.SetLinearDriveParams(Most / 0.1, Most / 1.0, Limit > 0.0 ? Limit * 100.0 : 0.0); // per cm, per cm/s
+			CI.SetLinearPositionTarget(FVector((Q - J.Mid) * 100.0, 0.0, 0.0));
+			CI.SetLinearVelocityTarget(FVector::ZeroVector);
+		}
+		else
+		{
+			CI.SetAngularDriveAccelerationMode(false);
+			CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
+			CI.SetOrientationDriveTwistAndSwing(true, false);
+			CI.SetAngularVelocityDriveTwistAndSwing(true, false);
+			CI.SetAngularDriveParams(Most / 0.02 * 1.0e4, Most / 0.2 * 1.0e4, Limit > 0.0 ? Limit * 1.0e4 : 0.0);
+			CI.SetAngularOrientationTarget(FQuat(FVector::XAxisVector, -(Q - J.Mid)));
+			CI.SetAngularVelocityTarget(FVector::ZeroVector);
+		}
+	}
+	else if (J.Kind == EJointKind::Slide)
+	{
+		CI.SetLinearPositionDrive(false, false, false);
+		CI.SetLinearVelocityDrive(false, false, false);
+	}
+	else
+	{
+		CI.SetOrientationDriveTwistAndSwing(false, false);
+		CI.SetAngularVelocityDriveTwistAndSwing(false, false);
+	}
+	Act.bBraked = bEngaged;
+	WakeRoots(J.ParentRoot, J.ChildRoot);
+	return true;
+}
+
+bool URammsChaosArticulationComponent::IsMotorBraked(FName Actuator) const
+{
+	const int32* Index = ActuatorByName.Find(Actuator);
+	return Index && Actuators[*Index].bBraked;
+}
+
+FName URammsChaosArticulationComponent::GetActuatorJoint(FName Actuator) const
+{
+	const int32* Index = ActuatorByName.Find(Actuator);
+	return (Index && Actuators[*Index].Joints.Num() > 0) ? Joints[Actuators[*Index].Joints[0].Key].Name : NAME_None;
+}
+
+bool URammsChaosArticulationComponent::GetJointBodyTransform(FName Joint, FTransform& OutWorld) const
+{
+	const int32* Index = JointByName.Find(Joint);
+	if (!Index || !MjBodies.IsValidIndex(Joints[*Index].Body))
+	{
+		return false;
+	}
+	const FMjBodyInfo& B = MjBodies[Joints[*Index].Body];
+	if (!Roots.IsValidIndex(B.Root) || !Roots[B.Root])
+	{
+		return false;
+	}
+	OutWorld = B.InRoot * Roots[B.Root]->GetComponentTransform();
 	return true;
 }
 
@@ -1189,23 +1655,40 @@ bool URammsChaosArticulationComponent::MeasureJoint(const FJoint& J, double& Out
 	return true;
 }
 
+bool URammsChaosArticulationComponent::ReadJoint(int32 Index, double& OutQ, double& OutQd) const
+{
+	if (!Joints.IsValidIndex(Index))
+	{
+		return false;
+	}
+	const FJoint& J = Joints[Index];
+	if (Callback)
+	{
+		FScopeLock Guard(&Callback->Lock);
+		if (Callback->Joints.IsValidIndex(Index) && Callback->Joints[Index].bMeasured)
+		{
+			const FRammsChaosArticulationCallback::FPtJoint& P = Callback->Joints[Index];
+			const double									 U = J.Kind == EJointKind::Slide ? 0.01 : 1.0; // cm -> m
+			OutQ = (J.bContinuous ? P.Counted : P.Q) * U;
+			OutQd = P.Qd * U;
+			return true;
+		}
+	}
+	return MeasureJoint(J, OutQ, OutQd); // before the first step
+}
+
 float URammsChaosArticulationComponent::GetJointPosition(FName Joint) const
 {
 	double		 Q = 0.0, Qd = 0.0;
 	const int32* Index = JointByName.Find(Joint);
-	if (!Index || !MeasureJoint(Joints[*Index], Q, Qd))
-	{
-		return 0.0f;
-	}
-	const FJoint& J = Joints[*Index];
-	return J.bContinuous ? (float)(J.Unwrapped + FMath::UnwindRadians(Q - J.LastWrapped)) : (float)Q;
+	return (Index && ReadJoint(*Index, Q, Qd)) ? (float)Q : 0.0f;
 }
 
 float URammsChaosArticulationComponent::GetJointVelocity(FName Joint) const
 {
 	double		 Q = 0.0, Qd = 0.0;
 	const int32* Index = JointByName.Find(Joint);
-	return (Index && MeasureJoint(Joints[*Index], Q, Qd)) ? (float)Qd : 0.0f;
+	return (Index && ReadJoint(*Index, Q, Qd)) ? (float)Qd : 0.0f;
 }
 
 TArray<FName> URammsChaosArticulationComponent::GetJointNames() const
@@ -1270,14 +1753,5 @@ void URammsChaosArticulationComponent::TickComponent(float DeltaTime, ELevelTick
 	if (bBuilt)
 	{
 		SyncVisuals();
-		for (FJoint& J : Joints)
-		{
-			double Q = 0.0, Qd = 0.0;
-			if (J.bContinuous && MeasureJoint(J, Q, Qd))
-			{
-				J.Unwrapped += FMath::UnwindRadians(Q - J.LastWrapped); // assumes under half a turn per frame
-				J.LastWrapped = Q;
-			}
-		}
 	}
 }
