@@ -64,6 +64,10 @@ public:
 
 	virtual ~FRammsMujocoActuationBackend() override;
 
+	/** The articulation a base component drives: its owner, else one attached under it (never one
+	 *  elsewhere in the level). Null when there is none. */
+	static AMjArticulation* FindArticulation(const URammsRobotBaseComponent& Base);
+
 private:
 	/** The joint an actuator's transmission drives, plus what a read needs. */
 	struct FTransmission

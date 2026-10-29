@@ -21,33 +21,8 @@ bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
 	TransmissionByMotor.Reset();
 	WarnedUnsupported.Reset();
 
-	// Resolve the articulation: the owner itself, else one attached under it
-	// (a composed robot whose base component lives on a parent actor). Never
-	// an arbitrary articulation elsewhere in the level — with Backend=Auto that
-	// would silently hijack an unrelated robot's actuators (and its control
-	// source) while leaving this one undriven.
 	AActor* Owner = Base.GetOwner();
-	if (!Owner)
-	{
-		return false;
-	}
-	if (AMjArticulation* AsArt = Cast<AMjArticulation>(Owner))
-	{
-		Articulation = AsArt;
-	}
-	else
-	{
-		TArray<AActor*> Children;
-		Owner->GetAttachedActors(Children, /*bResetArray=*/true, /*bRecursivelyIncludeAttachedActors=*/true);
-		for (AActor* Child : Children)
-		{
-			if (AMjArticulation* ChildArt = Cast<AMjArticulation>(Child))
-			{
-				Articulation = ChildArt;
-				break;
-			}
-		}
-	}
+	Articulation = FindArticulation(Base);
 	if (!Articulation.IsValid())
 	{
 		return false; // no MuJoCo articulation on this robot — base component falls back
@@ -71,6 +46,34 @@ bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
 		}
 	}
 	return true;
+}
+
+AMjArticulation* FRammsMujocoActuationBackend::FindArticulation(const URammsRobotBaseComponent& Base)
+{
+	// The owner itself, else one attached under it (a composed robot whose base
+	// component lives on a parent actor). Never an arbitrary articulation
+	// elsewhere in the level — with Backend=Auto that would silently hijack an
+	// unrelated robot's actuators (and its control source) while leaving this
+	// one undriven.
+	AActor* Owner = Base.GetOwner();
+	if (!Owner)
+	{
+		return nullptr;
+	}
+	if (AMjArticulation* AsArt = Cast<AMjArticulation>(Owner))
+	{
+		return AsArt;
+	}
+	TArray<AActor*> Children;
+	Owner->GetAttachedActors(Children, /*bResetArray=*/true, /*bRecursivelyIncludeAttachedActors=*/true);
+	for (AActor* Child : Children)
+	{
+		if (AMjArticulation* ChildArt = Cast<AMjArticulation>(Child))
+		{
+			return ChildArt;
+		}
+	}
+	return nullptr;
 }
 
 UMjNodeComponent* FRammsMujocoActuationBackend::ResolveActuator(FName MotorId) const
