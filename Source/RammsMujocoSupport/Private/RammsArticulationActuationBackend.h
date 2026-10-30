@@ -82,6 +82,7 @@ public:
 		float StartFrom) override;
 	virtual void   ClearPositionProfile(FName MotorId) override;
 	virtual bool   SimulatesMotorJoint(FName MotorId) const override { return Active().SimulatesMotorJoint(MotorId); }
+	virtual bool   HasMotorBrake(FName MotorId) const override { return Active().HasMotorBrake(MotorId); }
 	virtual bool   SetMotorBrake(FName MotorId, bool bEngaged) override { return Active().SetMotorBrake(MotorId, bEngaged); }
 
 private:
