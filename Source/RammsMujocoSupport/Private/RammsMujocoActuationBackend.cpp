@@ -22,6 +22,7 @@ bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
 	WarnedUnsupported.Reset();
 
 	AActor* Owner = Base.GetOwner();
+	BaseComponent = &Base;
 	Articulation = FindArticulation(Base);
 	if (!Articulation.IsValid())
 	{
@@ -292,6 +293,11 @@ FRammsMujocoActuationBackend::~FRammsMujocoActuationBackend()
 		DriveTable->Drives.Reset();
 		DriveTable->Profiles.Reset();
 		DriveTable->Articulation = nullptr;
+		// Kept for the callback to put back the friction they raised.
+		for (TPair<FName, FPhysicsBrake>& Pair : DriveTable->Brakes)
+		{
+			Pair.Value.bEngaged = false;
+		}
 	}
 }
 
@@ -332,7 +338,12 @@ bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetR
 
 	FDriveTable& Table = EnsureDriveTable(*Engine);
 	{
-		FScopeLock	   Lock(&Table.Lock);
+		FScopeLock Lock(&Table.Lock);
+		// A wheel driven at a speed is not also braked.
+		if (FPhysicsBrake* Brake = Table.Brakes.Find(MotorId))
+		{
+			Brake->bEngaged = false;
+		}
 		FPhysicsDrive& Drive = Table.Drives.FindOrAdd(MotorId);
 		if (Drive.ActuatorId != ActuatorId)
 		{
@@ -439,6 +450,124 @@ void FRammsMujocoActuationBackend::ClearPositionProfile(FName MotorId)
 	}
 }
 
+bool FRammsMujocoActuationBackend::ResolveBrake(FName MotorId, UMjPhysicsEngine*& OutEngine, const mjModel_*& OutModel, int32& OutDofAdr,
+	double& OutTorque) const
+{
+	UMjNodeComponent*	 Actuator = ResolveActuator(MotorId);
+	const FTransmission* Transmission = ResolveTransmission(MotorId);
+	if (!Actuator || !Transmission || !Articulation.IsValid())
+	{
+		return false;
+	}
+	const TOptional<int32>& Bound = Actuator->GetBoundId();
+	UMjPhysicsEngine*		Engine = AAMjManager::ResolveEngine(Actuator);
+	const mjModel*			Model = Engine ? Engine->GetModel() : nullptr;
+	if (!Bound.IsSet() || !Model)
+	{
+		return false;
+	}
+	const int32 ActuatorId = Bound.GetValue();
+	if (ActuatorId < 0 || ActuatorId >= Model->nu || Model->actuator_trntype[ActuatorId] != mjTRN_JOINT)
+	{
+		return false;
+	}
+	const int32 Joint = Model->actuator_trnid[2 * ActuatorId];
+	if (Joint < 0 || Joint >= Model->njnt || (Model->jnt_type[Joint] != mjJNT_HINGE && Model->jnt_type[Joint] != mjJNT_SLIDE))
+	{
+		return false;
+	}
+	// A motor: its force its gain times its command, nothing more. A servo
+	// (position, velocity) or an actuator with dynamics holds by its own law.
+	if (Model->actuator_gaintype[ActuatorId] != mjGAIN_FIXED || Model->actuator_biastype[ActuatorId] != mjBIAS_NONE
+		|| Model->actuator_dyntype[ActuatorId] != mjDYN_NONE)
+	{
+		return false;
+	}
+	// It holds with its own rating (FRammsMotorSpec::BrakeTorque), else with
+	// what the motor can do about its joint: a steeper slope rolls the robot.
+	FRammsMotorSpec					Spec;
+	const URammsRobotBaseComponent* Base = BaseComponent.Get();
+	if (Base && Base->GetMotorSpec(MotorId, Spec) && Spec.BrakeTorque > 0.0f)
+	{
+		OutEngine = Engine;
+		OutModel = Model;
+		OutDofAdr = Model->jnt_dofadr[Joint];
+		OutTorque = Spec.BrakeTorque;
+		return true;
+	}
+	const mjtNum* Range = &Model->actuator_ctrlrange[2 * ActuatorId];
+	const mjtNum* Force = &Model->actuator_forcerange[2 * ActuatorId];
+	double		  Most = 0.0;
+	if (Model->actuator_ctrllimited[ActuatorId])
+	{
+		Most = FMath::Max(FMath::Abs(Range[0]), FMath::Abs(Range[1])) * FMath::Abs(Model->actuator_gainprm[ActuatorId * mjNGAIN]);
+	}
+	if (Model->actuator_forcelimited[ActuatorId])
+	{
+		const double Limit = FMath::Max(FMath::Abs(Force[0]), FMath::Abs(Force[1]));
+		Most = Most > 0.0 ? FMath::Min(Most, Limit) : Limit;
+	}
+	Most *= FMath::Abs(Model->actuator_gear[6 * ActuatorId]);
+	if (Model->jnt_actfrclimited[Joint])
+	{
+		const mjtNum* Joints = &Model->jnt_actfrcrange[2 * Joint];
+		const double  Limit = FMath::Max(FMath::Abs(Joints[0]), FMath::Abs(Joints[1]));
+		Most = Most > 0.0 ? FMath::Min(Most, Limit) : Limit;
+	}
+	// An unlimited motor: a brake that holds whatever the robot puts on it.
+	constexpr double UnlimitedHoldNm = 1000.0;
+	OutEngine = Engine;
+	OutModel = Model;
+	OutDofAdr = Model->jnt_dofadr[Joint];
+	OutTorque = Most > 0.0 ? Most : UnlimitedHoldNm;
+	return true;
+}
+
+bool FRammsMujocoActuationBackend::HasMotorBrake(FName MotorId) const
+{
+	UMjPhysicsEngine* Engine = nullptr;
+	const mjModel*	  Model = nullptr;
+	int32			  DofAdr = INDEX_NONE;
+	double			  Torque = 0.0;
+	return ResolveBrake(MotorId, Engine, Model, DofAdr, Torque);
+}
+
+bool FRammsMujocoActuationBackend::SetMotorBrake(FName MotorId, bool bEngaged)
+{
+	UMjPhysicsEngine* Engine = nullptr;
+	const mjModel*	  Model = nullptr;
+	int32			  DofAdr = INDEX_NONE;
+	double			  Torque = 0.0;
+	const bool		  bHas = ResolveBrake(MotorId, Engine, Model, DofAdr, Torque);
+	if (!bEngaged)
+	{
+		if (DriveTable)
+		{
+			FScopeLock Lock(&DriveTable->Lock);
+			if (FPhysicsBrake* Brake = DriveTable->Brakes.Find(MotorId))
+			{
+				Brake->bEngaged = false; // the callback puts the friction back
+			}
+		}
+		return bHas;
+	}
+	if (!bHas)
+	{
+		return false;
+	}
+	FDriveTable& Table = EnsureDriveTable(*Engine);
+	FScopeLock	 Lock(&Table.Lock);
+	// A braked wheel is not also driven at a speed.
+	Table.Drives.Remove(MotorId);
+	Table.Articulation = Articulation.Get();
+	FPhysicsBrake& Brake = Table.Brakes.FindOrAdd(MotorId);
+	Brake.Model = Model;
+	Brake.DofAdr = DofAdr;
+	Brake.Torque = Torque;
+	Brake.bEngaged = true;
+	return true;
+}
+
 FRammsMujocoActuationBackend::FDriveTable& FRammsMujocoActuationBackend::EnsureDriveTable(UMjPhysicsEngine& Engine)
 {
 	if (!DriveTable)
@@ -454,10 +583,16 @@ FRammsMujocoActuationBackend::FDriveTable& FRammsMujocoActuationBackend::EnsureD
 	return *DriveTable;
 }
 
-void FRammsMujocoActuationBackend::StepTable(FDriveTable& Table, const mjModel_* Model, const mjData_* Data)
+void FRammsMujocoActuationBackend::StepTable(FDriveTable& Table, mjModel_* Model, const mjData_* Data)
 {
 	FScopeLock Lock(&Table.Lock);
-	if (!Table.bAlive || !Table.Articulation || !Model || !Data)
+	if (!Model || !Data)
+	{
+		return;
+	}
+	// First, and on a dead table too: it still puts back what it raised.
+	StepBrakes(Table, Model);
+	if (!Table.bAlive || !Table.Articulation)
 	{
 		return;
 	}
@@ -486,6 +621,60 @@ void FRammsMujocoActuationBackend::StepTable(FDriveTable& Table, const mjModel_*
 	Table.LastTime = Now;
 	StepDrives(Table, Model, Data, Dt);
 	StepProfiles(Table, Model, Data, Dt);
+}
+
+void FRammsMujocoActuationBackend::StepBrakes(FDriveTable& Table, mjModel_* Model)
+{
+	// MuJoCo makes its constraints afresh every step from the model, so a
+	// joint's friction loss raised before the step holds it in that step's
+	// solve: dry friction up to the brake's torque, together with the
+	// contacts, at the physics rate. A brake resolved against another model
+	// (a recompile since) holds nothing until it is set again.
+	//
+	// The friction is made hard too. MuJoCo's constraints are soft: under a
+	// steady load one slides at about the load times its regulariser over its
+	// damping, and the regulariser scales with the inverse of the inertia the
+	// dof sees -- a wheel's own spin inertia, small -- so at the default
+	// impedance (0.9) a braked wheel carrying a share of a robot on a slope
+	// slid at tenths of a rad/s. At 0.999 over a time constant of two steps it
+	// slides about a thousand times slower.
+	static_assert(sizeof(FPhysicsBrake::OriginalRef) == mjNREF * sizeof(mjtNum), "a dof's solref");
+	static_assert(sizeof(FPhysicsBrake::OriginalImp) == mjNIMP * sizeof(mjtNum), "a dof's solimp");
+	constexpr double BrakeImpedance = 0.999;
+	const double	 BrakeTimeConst = 2.0 * Model->opt.timestep;
+	for (auto It = Table.Brakes.CreateIterator(); It; ++It)
+	{
+		FPhysicsBrake& Brake = It.Value();
+		const bool	   bHold = Table.bAlive && Brake.bEngaged && Brake.Model == Model && Brake.DofAdr >= 0 && Brake.DofAdr < Model->nv;
+		mjtNum* const  Ref = bHold || Brake.RaisedIn == Model ? &Model->dof_solref[Brake.DofAdr * mjNREF] : nullptr;
+		mjtNum* const  Imp = Ref ? &Model->dof_solimp[Brake.DofAdr * mjNIMP] : nullptr;
+		if (bHold)
+		{
+			if (Brake.RaisedIn != Model)
+			{
+				Brake.Original = Model->dof_frictionloss[Brake.DofAdr];
+				FMemory::Memcpy(Brake.OriginalRef, Ref, sizeof(Brake.OriginalRef));
+				FMemory::Memcpy(Brake.OriginalImp, Imp, sizeof(Brake.OriginalImp));
+				Brake.RaisedIn = Model;
+			}
+			Model->dof_frictionloss[Brake.DofAdr] = FMath::Max(Brake.Original, Brake.Torque);
+			Ref[0] = BrakeTimeConst;
+			Ref[1] = 1.0;
+			Imp[0] = Imp[1] = BrakeImpedance; // a friction constraint sits at the low end: no violation
+			continue;
+		}
+		if (Brake.RaisedIn == Model)
+		{
+			Model->dof_frictionloss[Brake.DofAdr] = Brake.Original;
+			FMemory::Memcpy(Ref, Brake.OriginalRef, sizeof(Brake.OriginalRef));
+			FMemory::Memcpy(Imp, Brake.OriginalImp, sizeof(Brake.OriginalImp));
+		}
+		Brake.RaisedIn = nullptr;
+		if (!Brake.bEngaged)
+		{
+			It.RemoveCurrent();
+		}
+	}
 }
 
 void FRammsMujocoActuationBackend::StepProfiles(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt)

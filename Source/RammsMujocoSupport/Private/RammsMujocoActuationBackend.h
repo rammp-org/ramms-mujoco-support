@@ -67,6 +67,17 @@ public:
 	virtual bool SetPositionProfile(FName MotorId, float Target, float MaxVelocity, float MaxAcceleration,
 		float StartFrom) override;
 	virtual void ClearPositionProfile(FName MotorId) override;
+	/** A plain force actuator (<motor>) on a hinge or slide joint. */
+	virtual bool HasMotorBrake(FName MotorId) const override;
+	/** Holds the joint with MuJoCo's own dry friction: its friction loss
+	 *  raised to the brake's rating (FRammsMotorSpec::BrakeTorque), else to
+	 *  the most the actuator can apply, in the same pre-step
+	 *  callback, so the step's solver holds it against the contacts every
+	 *  physics step -- a slope's pull, or the robot turning about the other
+	 *  wheel. The actuator's own command still acts (a motor holding a slope's
+	 *  pull, the brake the rest); a velocity loop on the motor is dropped, and
+	 *  SetVelocityDrive releases the brake. */
+	virtual bool SetMotorBrake(FName MotorId, bool bEngaged) override;
 
 	virtual ~FRammsMujocoActuationBackend() override;
 
@@ -91,6 +102,10 @@ private:
 	const FTransmission* ResolveTransmission(FName MotorId) const;
 
 	TWeakObjectPtr<AMjArticulation> Articulation;
+
+	/** The robot base this backend drives: its motor registry rates the brakes
+	 *  (FRammsMotorSpec::BrakeTorque). */
+	TWeakObjectPtr<const URammsRobotBaseComponent> BaseComponent;
 
 	/** Id -> actuator node, filled on first use. mutable: reads resolve lazily. */
 	mutable TMap<FName, TWeakObjectPtr<UMjNodeComponent>> ActuatorByMotor;
@@ -136,17 +151,42 @@ private:
 		RammsMotion::FFollower Follower;
 	};
 
+	/** One motor's brake (SetMotorBrake), as the physics thread applies it:
+	 *  its joint's friction loss raised to Torque while engaged, the friction
+	 *  made hard, and both put back once released. */
+	struct FPhysicsBrake
+	{
+		/** The model DofAdr indexes; the brake holds only in that one. */
+		const mjModel_* Model = nullptr;
+		int32			DofAdr = INDEX_NONE;
+		double			Torque = 0.0;
+		bool			bEngaged = false;
+		/** The model the friction is raised in now (null: not raised), and the
+		 *  joint's own friction loss and its solver parameters, to put back. */
+		const mjModel_* RaisedIn = nullptr;
+		double			Original = 0.0;
+		double			OriginalRef[2] = {};
+		double			OriginalImp[5] = {};
+	};
+
+	/** A motor's brake as SetMotorBrake would apply it: the model, the joint's
+	 *  dof and the torque it holds with. False when the motor has none (not
+	 *  compiled yet, not a plain force actuator on a hinge or slide). */
+	bool ResolveBrake(FName MotorId, UMjPhysicsEngine*& OutEngine, const mjModel_*& OutModel, int32& OutDofAdr, double& OutTorque) const;
+
 	/**
-	 * The loops and profiles, shared with the pre-step callback. The callback
-	 * outlives this backend -- URLab has no way to unregister one -- so it
-	 * holds the table, and the destructor marks the table dead under its lock
-	 * rather than freeing anything the physics thread may be reading.
+	 * The loops, profiles and brakes, shared with the pre-step callback. The
+	 * callback outlives this backend -- URLab has no way to unregister one -- so
+	 * it holds the table, and the destructor marks the table dead under its
+	 * lock rather than freeing anything the physics thread may be reading (the
+	 * callback puts back what the brakes raised).
 	 */
 	struct FDriveTable
 	{
 		FCriticalSection			 Lock;
 		TMap<FName, FPhysicsDrive>	 Drives;
 		TMap<FName, FPhysicsProfile> Profiles;
+		TMap<FName, FPhysicsBrake>	 Brakes;
 		AMjArticulation*			 Articulation = nullptr;
 		bool						 bAlive = true;
 		/** mjData::time at the last callback; negative before the first. */
@@ -159,9 +199,11 @@ private:
 	 *  with Engine. */
 	FDriveTable& EnsureDriveTable(UMjPhysicsEngine& Engine);
 
-	/** One physics step of every loop and profile; physics thread, under
-	 *  CallbackMutex. Time is the simulation's: no step while it is paused. */
-	static void StepTable(FDriveTable& Table, const mjModel_* Model, const mjData_* Data);
+	/** One physics step of every loop, profile and brake; physics thread,
+	 *  under CallbackMutex. Time is the simulation's: no step while it is
+	 *  paused. */
+	static void StepTable(FDriveTable& Table, mjModel_* Model, const mjData_* Data);
+	static void StepBrakes(FDriveTable& Table, mjModel_* Model);
 	static void StepDrives(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt);
 	static void StepProfiles(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt);
 };
