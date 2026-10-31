@@ -22,6 +22,7 @@ bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
 	WarnedUnsupported.Reset();
 
 	AActor* Owner = Base.GetOwner();
+	BaseComponent = &Base;
 	Articulation = FindArticulation(Base);
 	if (!Articulation.IsValid())
 	{
@@ -482,8 +483,18 @@ bool FRammsMujocoActuationBackend::ResolveBrake(FName MotorId, UMjPhysicsEngine*
 	{
 		return false;
 	}
-	// It holds with what the motor can do about its joint, as the Chaos
-	// brake does: a steeper slope rolls the robot.
+	// It holds with its own rating (FRammsMotorSpec::BrakeTorque), else with
+	// what the motor can do about its joint: a steeper slope rolls the robot.
+	FRammsMotorSpec					Spec;
+	const URammsRobotBaseComponent* Base = BaseComponent.Get();
+	if (Base && Base->GetMotorSpec(MotorId, Spec) && Spec.BrakeTorque > 0.0f)
+	{
+		OutEngine = Engine;
+		OutModel = Model;
+		OutDofAdr = Model->jnt_dofadr[Joint];
+		OutTorque = Spec.BrakeTorque;
+		return true;
+	}
 	const mjtNum* Range = &Model->actuator_ctrlrange[2 * ActuatorId];
 	const mjtNum* Force = &Model->actuator_forcerange[2 * ActuatorId];
 	double		  Most = 0.0;

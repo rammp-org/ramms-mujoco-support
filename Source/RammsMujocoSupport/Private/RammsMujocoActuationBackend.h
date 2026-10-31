@@ -70,7 +70,8 @@ public:
 	/** A plain force actuator (<motor>) on a hinge or slide joint. */
 	virtual bool HasMotorBrake(FName MotorId) const override;
 	/** Holds the joint with MuJoCo's own dry friction: its friction loss
-	 *  raised to the most the actuator can apply, in the same pre-step
+	 *  raised to the brake's rating (FRammsMotorSpec::BrakeTorque), else to
+	 *  the most the actuator can apply, in the same pre-step
 	 *  callback, so the step's solver holds it against the contacts every
 	 *  physics step -- a slope's pull, or the robot turning about the other
 	 *  wheel. The actuator's own command still acts (a motor holding a slope's
@@ -101,6 +102,10 @@ private:
 	const FTransmission* ResolveTransmission(FName MotorId) const;
 
 	TWeakObjectPtr<AMjArticulation> Articulation;
+
+	/** The robot base this backend drives: its motor registry rates the brakes
+	 *  (FRammsMotorSpec::BrakeTorque). */
+	TWeakObjectPtr<const URammsRobotBaseComponent> BaseComponent;
 
 	/** Id -> actuator node, filled on first use. mutable: reads resolve lazily. */
 	mutable TMap<FName, TWeakObjectPtr<UMjNodeComponent>> ActuatorByMotor;
