@@ -122,18 +122,6 @@ void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32
 		}
 	}
 
-	// Arm = the joint-transmission position actuators from Bindings (everything but the gripper).
-	for (const FActuatorBinding& B : Bindings)
-	{
-		if (!B.Component || B.ActuatorMjID == GripActId)
-			continue;
-		if (B.QposAddr < 0 || B.QvelAddr < 0)
-			continue;  // not a single-dof joint actuator
-		ArmActIds.Add(B.ActuatorMjID);
-		ArmQposAddr.Add(B.QposAddr);
-		ArmDofAddr.Add(B.QvelAddr);
-	}
-
 	// Resolve the EE site within this arm's prefix against the compiled names.
 	EeSiteId = -1;
 	for (int s = 0; s < m->nsite; ++s)
@@ -143,6 +131,26 @@ void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32
 			EeSiteId = s;
 			break;
 		}
+	}
+
+	// Arm = the joint-transmission actuators from Bindings whose joint moves the EE site: on the chain from the
+	// root down to the site's body. That is every one of them on an arm alone; on an arm composed onto a mobile
+	// base in one articulation it leaves out the base's wheels and lifts, which the IK must not drive.
+	TSet<int32> EeChain;
+	for (int b = EeSiteId >= 0 ? m->site_bodyid[EeSiteId] : 0; b > 0; b = m->body_parentid[b])
+		EeChain.Add(b);
+	for (const FActuatorBinding& B : Bindings)
+	{
+		if (!B.Component || B.ActuatorMjID == GripActId)
+			continue;
+		if (B.QposAddr < 0 || B.QvelAddr < 0)
+			continue; // not a single-dof joint actuator
+		const int32 Joint = m->actuator_trnid[2 * B.ActuatorMjID];
+		if (Joint < 0 || Joint >= m->njnt || !EeChain.Contains(m->jnt_bodyid[Joint]))
+			continue; // a joint that does not move the end effector
+		ArmActIds.Add(B.ActuatorMjID);
+		ArmQposAddr.Add(B.QposAddr);
+		ArmDofAddr.Add(B.QvelAddr);
 	}
 
 	// Base frame = the arm's root body (the direct child of worldbody above the EE site). When that

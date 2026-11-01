@@ -17,7 +17,8 @@ class UMjNodeComponent;
  * auto-initializes to the current EE pose on the first step so it doesn't snap.
  *
  * All target poses are in MuJoCo world coordinates (metres). Add this component to the imported
- * AMjArticulation Blueprint.
+ * AMjArticulation Blueprint. On an arm composed onto a mobile base in one articulation it drives only
+ * the joints between the base and the end effector; the base's actuators keep their own commands.
  */
 UCLASS(ClassGroup = (Ramms), meta = (BlueprintSpawnableComponent))
 class RAMMSMUJOCOSUPPORT_API URammsMjEndEffectorController : public UMjArticulationController
@@ -56,9 +57,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK|Home")
 	bool bApplyHomeOnBind = true;
 
-	/** Keep the EE target fixed relative to the arm's root body (the mocap base_link) instead of a
-	 *  fixed MuJoCo world pose. Lets the arm ride a moving base (e.g. the RAMMP chair) without the IK
-	 *  fighting to hold a world point. When true, target poses are expressed in the base frame. */
+	/** Keep the EE target fixed relative to the arm's root body (the mocap base_link, or the chassis of
+	 *  a base the arm is composed onto) instead of a fixed MuJoCo world pose. Lets the arm ride a moving
+	 *  base (e.g. the RAMMP chair) without the IK fighting to hold a world point. When true, target
+	 *  poses are expressed in the base frame. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK")
 	bool bTrackBaseFrame = true;
 
