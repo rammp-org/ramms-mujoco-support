@@ -153,8 +153,15 @@ const FRammsMujocoActuationBackend::FTransmission* FRammsMujocoActuationBackend:
 	Trn.Joint = Joint;
 	Trn.BodyId = Model->jnt_bodyid[JointId];
 	Trn.bSlide = Model->jnt_type[JointId] == mjJNT_SLIDE;
-	// <position>: an affine bias that pulls the joint to its ctrl.
-	Trn.bServo = Model->actuator_biastype[ActId] == mjBIAS_AFFINE && Model->actuator_biasprm[ActId * mjNBIAS + 1] != 0;
+	// <position>: an affine bias that pulls its length (gear x q) to its ctrl. Not <intvelocity>,
+	// which has the same bias but integrates its ctrl (a speed) into that target.
+	Trn.bServo = Model->actuator_biastype[ActId] == mjBIAS_AFFINE && Model->actuator_biasprm[ActId * mjNBIAS + 1] != 0
+		&& Model->actuator_dyntype[ActId] != mjDYN_INTEGRATOR;
+	const double Gear = Model->actuator_gear[6 * ActId];
+	if (Trn.bServo && FMath::Abs(Gear) > UE_SMALL_NUMBER)
+	{
+		Trn.CtrlPerUnit = Gear / (Trn.bSlide ? 100.0 : 1.0);
+	}
 	return &TransmissionByMotor.Add(MotorId, Trn);
 }
 
@@ -168,12 +175,11 @@ void FRammsMujocoActuationBackend::SetCommand(FName MotorId, float Value)
 	{
 		return;
 	}
-	// A position servo on a slide takes its target in cm, as GetValue reports
-	// the joint; its ctrl is metres.
-	const FTransmission* Trn = ResolveTransmission(MotorId);
-	if (Trn && Trn->bServo && Trn->bSlide)
+	// A position servo takes its target as its joint's position, as GetValue
+	// reports it (cm for a slide); its ctrl is gear x that, in metres.
+	if (const FTransmission* Trn = ResolveTransmission(MotorId))
 	{
-		Value *= 0.01f;
+		Value *= static_cast<float>(Trn->CtrlPerUnit);
 	}
 	// Clamp to the compiled actuator's ctrlrange so the staged value matches what
 	// the integrator will apply (zero-width range = unlimited, leave as-is).
@@ -436,8 +442,13 @@ bool FRammsMujocoActuationBackend::SetPositionProfile(FName MotorId, float Targe
 	Profile.ActuatorId = ActuatorId;
 	Profile.QposAdr = Model->jnt_qposadr[Joint];
 	Profile.Scale = Transmission->bSlide ? 100.0 : 1.0;
-	Profile.Lo = Range.X * Profile.Scale;
-	Profile.Hi = Range.Y * Profile.Scale;
+	Profile.CtrlPerUnit = Transmission->bServo ? Transmission->CtrlPerUnit : 1.0 / Profile.Scale;
+	Profile.Lo = Range.X / Profile.CtrlPerUnit;
+	Profile.Hi = Range.Y / Profile.CtrlPerUnit;
+	if (Profile.CtrlPerUnit < 0.0)
+	{
+		Swap(Profile.Lo, Profile.Hi); // a negative gear reverses the bounds
+	}
 	Profile.MaxVelocity = MaxVelocity;
 	Profile.MaxAcceleration = MaxAcceleration;
 	Profile.Target = Target;
@@ -718,7 +729,7 @@ void FRammsMujocoActuationBackend::StepProfiles(FDriveTable& Table, const mjMode
 		{
 			Setpoint = FMath::Clamp(Setpoint, Profile.Lo, Profile.Hi);
 		}
-		Table.Articulation->StageInternalControl(Profile.ActuatorId, Setpoint / Profile.Scale);
+		Table.Articulation->StageInternalControl(Profile.ActuatorId, Setpoint * Profile.CtrlPerUnit);
 	}
 }
 

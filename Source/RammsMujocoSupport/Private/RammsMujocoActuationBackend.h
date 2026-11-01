@@ -91,8 +91,9 @@ private:
 	{
 		TWeakObjectPtr<UMjNodeComponent> Joint;
 		int32							 BodyId = -1;
-		bool							 bSlide = false; // qpos/qvel in metres -> cm
-		bool							 bServo = false; // a position servo: its ctrl is the joint's position
+		bool							 bSlide = false;	// qpos/qvel in metres -> cm
+		bool							 bServo = false;	// a position servo: its ctrl is a target for its length (gear x q)
+		double							 CtrlPerUnit = 1.0; // a servo's ctrl per robot unit of its joint (gear / 100 on a slide); else 1
 	};
 
 	/** Resolve (and cache) the actuator node for a motor Id, or nullptr. */
@@ -134,13 +135,14 @@ private:
 
 	/** One position actuator's profile (SetPositionProfile), as the physics
 	 *  thread steps it. Target and the setpoint are in the robot's units (cm
-	 *  for a slide joint); ctrl is the setpoint / Scale. */
+	 *  for a slide joint); ctrl is the setpoint x CtrlPerUnit. */
 	struct FPhysicsProfile
 	{
 		int32				   ActuatorId = INDEX_NONE;
 		int32				   QposAdr = INDEX_NONE;
-		double				   Scale = 1.0; // robot units per qpos unit (100 for a slide joint)
-		double				   Lo = 0.0;	// ctrlrange in robot units; Lo >= Hi: none
+		double				   Scale = 1.0;		  // robot units per qpos unit (100 for a slide joint)
+		double				   CtrlPerUnit = 1.0; // ctrl per robot unit (FTransmission::CtrlPerUnit for a servo)
+		double				   Lo = 0.0;		  // ctrlrange in robot units; Lo >= Hi: none
 		double				   Hi = 0.0;
 		double				   MaxVelocity = 0.0;
 		double				   MaxAcceleration = 0.0;

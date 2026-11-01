@@ -215,6 +215,10 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
 	bool IsMotor(FName Actuator) const;
 
+	/** Whether an actuator is a position servo: its control is its joint's target position (rad or m). */
+	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
+	bool IsPositionServo(FName Actuator) const;
+
 	/** The joint an actuator drives (the first, for a tendon across several), or None. */
 	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
 	FName GetActuatorJoint(FName Actuator) const;

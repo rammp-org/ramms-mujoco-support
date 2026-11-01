@@ -53,7 +53,7 @@ surface and input maps work unchanged:
 | `IRammsActuationBackend` | on Chaos |
 |---|---|
 | motor Id | the MJCF actuator name, as on MuJoCo |
-| `SetCommand` | `SetControl` in ctrl units (a value set before the build is kept until it) |
+| `SetCommand` | `SetControl` in ctrl units (a value set before the build is kept until it). A position servo on a slide takes its target in cm, as `GetValue` reads the joint and as on MuJoCo, and the control gets metres |
 | `GetValue` / `GetVelocity` | the actuator's joint, rad or cm (cm/s) |
 | `GetMotorTransform` | the MuJoCo body that joint moves |
 | `SetVelocityDrive` | a torque motor's speed loop: the proportional term is the joint constraint's velocity drive, solved implicitly; the integral is applied by the physics-rate callback. An explicit loop at Chaos' 10 ms step is unstable at a wheel's gains once the light link it hangs from is in the loop |

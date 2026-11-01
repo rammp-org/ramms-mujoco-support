@@ -1134,7 +1134,9 @@ void URammsChaosArticulationComponent::ApplyActuator(int32 Index)
 			const double Target = (Act.Gain * Act.Ctrl + Act.Bias0) / Act.Kp;
 			if (J.Kind == EJointKind::Slide)
 			{
-				CI.SetLinearPositionTarget(FVector((Target - J.Mid) * 100.0, 0.0, 0.0));
+				// As for a hinge: the target is the parent frame seen from the child's, the opposite sense
+				// to the slide the joint reads.
+				CI.SetLinearPositionTarget(FVector(-(Target - J.Mid) * 100.0, 0.0, 0.0));
 			}
 			else
 			{
@@ -1148,7 +1150,7 @@ void URammsChaosArticulationComponent::ApplyActuator(int32 Index)
 			const double Rate = Act.Gain * Act.Ctrl / Act.Kv;
 			if (J.Kind == EJointKind::Slide)
 			{
-				CI.SetLinearVelocityTarget(FVector(Rate * 100.0, 0.0, 0.0));
+				CI.SetLinearVelocityTarget(FVector(-Rate * 100.0, 0.0, 0.0)); // same sense as the position target
 			}
 			else
 			{
@@ -1347,7 +1349,7 @@ bool URammsChaosArticulationComponent::SetVelocityDrive(FName Actuator, double T
 				CI.SetLinearVelocityDrive(true, false, false);
 			}
 			CI.SetLinearDriveParams(0.0f, Damping, Limit > 0.0 ? Limit * 100.0 : 0.0);
-			CI.SetLinearVelocityTarget(FVector(Rate * 100.0, 0.0, 0.0));
+			CI.SetLinearVelocityTarget(FVector(-Rate * 100.0, 0.0, 0.0)); // the drive's sense, as for a hinge
 		}
 		else
 		{
@@ -1491,7 +1493,8 @@ bool URammsChaosArticulationComponent::SetMotorBrake(FName Actuator, bool bEngag
 			CI.SetLinearPositionDrive(true, false, false);
 			CI.SetLinearVelocityDrive(true, false, false);
 			CI.SetLinearDriveParams(Most / 0.1, Most / 1.0, Limit > 0.0 ? Limit * 100.0 : 0.0); // per cm, per cm/s
-			CI.SetLinearPositionTarget(FVector((Q - J.Mid) * 100.0, 0.0, 0.0));
+			// The drive's sense, as for a hinge.
+			CI.SetLinearPositionTarget(FVector(-(Q - J.Mid) * 100.0, 0.0, 0.0));
 			CI.SetLinearVelocityTarget(FVector::ZeroVector);
 		}
 		else
@@ -1637,6 +1640,12 @@ bool URammsChaosArticulationComponent::IsMotor(FName Actuator) const
 {
 	const int32* Index = ActuatorByName.Find(Actuator);
 	return Index && Actuators[*Index].Kind == EActuatorKind::Motor;
+}
+
+bool URammsChaosArticulationComponent::IsPositionServo(FName Actuator) const
+{
+	const int32* Index = ActuatorByName.Find(Actuator);
+	return Index && Actuators[*Index].Kind == EActuatorKind::PositionServo;
 }
 
 bool URammsChaosArticulationComponent::MeasureJoint(const FJoint& J, double& OutQ, double& OutQd) const
