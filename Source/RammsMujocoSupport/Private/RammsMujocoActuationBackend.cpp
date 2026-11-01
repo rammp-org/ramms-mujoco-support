@@ -153,6 +153,8 @@ const FRammsMujocoActuationBackend::FTransmission* FRammsMujocoActuationBackend:
 	Trn.Joint = Joint;
 	Trn.BodyId = Model->jnt_bodyid[JointId];
 	Trn.bSlide = Model->jnt_type[JointId] == mjJNT_SLIDE;
+	// <position>: an affine bias that pulls the joint to its ctrl.
+	Trn.bServo = Model->actuator_biastype[ActId] == mjBIAS_AFFINE && Model->actuator_biasprm[ActId * mjNBIAS + 1] != 0;
 	return &TransmissionByMotor.Add(MotorId, Trn);
 }
 
@@ -165,6 +167,13 @@ void FRammsMujocoActuationBackend::SetCommand(FName MotorId, float Value)
 	if (!Actuator)
 	{
 		return;
+	}
+	// A position servo on a slide takes its target in cm, as GetValue reports
+	// the joint; its ctrl is metres.
+	const FTransmission* Trn = ResolveTransmission(MotorId);
+	if (Trn && Trn->bServo && Trn->bSlide)
+	{
+		Value *= 0.01f;
 	}
 	// Clamp to the compiled actuator's ctrlrange so the staged value matches what
 	// the integrator will apply (zero-width range = unlimited, leave as-is).
@@ -427,8 +436,8 @@ bool FRammsMujocoActuationBackend::SetPositionProfile(FName MotorId, float Targe
 	Profile.ActuatorId = ActuatorId;
 	Profile.QposAdr = Model->jnt_qposadr[Joint];
 	Profile.Scale = Transmission->bSlide ? 100.0 : 1.0;
-	Profile.Lo = Range.X;
-	Profile.Hi = Range.Y;
+	Profile.Lo = Range.X * Profile.Scale;
+	Profile.Hi = Range.Y * Profile.Scale;
 	Profile.MaxVelocity = MaxVelocity;
 	Profile.MaxAcceleration = MaxAcceleration;
 	Profile.Target = Target;
@@ -709,7 +718,7 @@ void FRammsMujocoActuationBackend::StepProfiles(FDriveTable& Table, const mjMode
 		{
 			Setpoint = FMath::Clamp(Setpoint, Profile.Lo, Profile.Hi);
 		}
-		Table.Articulation->StageInternalControl(Profile.ActuatorId, Setpoint);
+		Table.Articulation->StageInternalControl(Profile.ActuatorId, Setpoint / Profile.Scale);
 	}
 }
 
