@@ -190,6 +190,8 @@ namespace
 	const FName ArmPitch(TEXT("arm.pitch"));
 	const FName ArmRoll(TEXT("arm.roll"));
 	const FName ArmResync(TEXT("arm.resync"));
+	const FName ArmStow(TEXT("arm.stow"));
+	const FName ArmStowed(TEXT("arm.stowed"));
 	const FName GripperOpen(TEXT("gripper.open"));
 	const FName GripperClose(TEXT("gripper.close"));
 	const FName GripperToggle(TEXT("gripper.toggle"));
@@ -232,6 +234,7 @@ void URammsMjArmTeleopComponent::DescribeControls(FRammsControlSurface& OutSurfa
 		OutSurface.Add(Axis);
 	};
 	Action(ArmResync, FName("Arm"), TEXT("Resync target"), 6);
+	Action(ArmStow, FName("Arm"), TEXT("Stow"), 7);
 	Action(GripperOpen, FName("Gripper"), TEXT("Open"), 0);
 	Action(GripperClose, FName("Gripper"), TEXT("Close"), 1);
 	Action(GripperToggle, FName("Gripper"), TEXT("Toggle"), 2);
@@ -248,6 +251,14 @@ void URammsMjArmTeleopComponent::DescribeControls(FRammsControlSurface& OutSurfa
 	Closed.bReadOnly = true; // state only: change it through the actions
 	Closed.Order = 3;
 	OutSurface.Add(Closed);
+
+	// Readback-only: 1 with every arm joint at its home (stowed) angle.
+	FRammsControlAxis Stowed = Closed;
+	Stowed.Id = ArmStowed;
+	Stowed.Group = FName("Arm");
+	Stowed.DisplayName = FText::FromString(TEXT("Stowed"));
+	Stowed.Order = 8;
+	OutSurface.Add(Stowed);
 }
 
 bool URammsMjArmTeleopComponent::ApplyControl(FName Id, float Value)
@@ -297,6 +308,10 @@ bool URammsMjArmTeleopComponent::TriggerControl(FName Id)
 	if (Id == ArmResync)
 	{
 		Controller->ResyncTargetToCurrentPose();
+	}
+	else if (Id == ArmStow)
+	{
+		Controller->Stow();
 	}
 	else if (Id == GripperOpen)
 	{
@@ -350,7 +365,7 @@ bool URammsMjArmTeleopComponent::ReleaseControl(FName Id)
 	{
 		ControlAngular.Roll = 0.0f;
 	}
-	else if (Id != GripperClosed)
+	else if (Id != GripperClosed && Id != ArmStowed)
 	{
 		return false;
 	}
@@ -362,6 +377,11 @@ bool URammsMjArmTeleopComponent::ReadControl(FName Id, float& OutValue) const
 	if (Id == GripperClosed)
 	{
 		OutValue = bGripClosed ? 1.0f : 0.0f;
+		return true;
+	}
+	if (Id == ArmStowed)
+	{
+		OutValue = Controller && Controller->IsStowed() ? 1.0f : 0.0f;
 		return true;
 	}
 	if (Id == ArmForward || Id == ArmStrafe || Id == ArmUp)

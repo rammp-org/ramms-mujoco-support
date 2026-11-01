@@ -17,7 +17,8 @@ class UMjNodeComponent;
  * auto-initializes to the current EE pose on the first step so it doesn't snap.
  *
  * All target poses are in MuJoCo world coordinates (metres). Add this component to the imported
- * AMjArticulation Blueprint.
+ * AMjArticulation Blueprint. On an arm composed onto a mobile base in one articulation it drives only
+ * the joints between the base and the end effector; the base's actuators keep their own commands.
  */
 UCLASS(ClassGroup = (Ramms), meta = (BlueprintSpawnableComponent))
 class RAMMSMUJOCOSUPPORT_API URammsMjEndEffectorController : public UMjArticulationController
@@ -34,6 +35,13 @@ public:
 	/** Gripper actuator identified when its (prefix-stripped) name ends with this. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK")
 	FString GripperActuatorSuffix = TEXT("fingers_actuator");
+
+	/** The arm's root body, matched by suffix like the site: the IK drives only the joints between it and the
+	 *  end-effector site. On an arm composed onto a mobile base that keeps the base's actuators (its wheels, a
+	 *  lift the arm rides on) out of the IK. Empty, or no such body above the site: every joint up to the
+	 *  articulation's root. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK")
+	FString ArmRootBodyName = TEXT("base_link");
 
 	/** Damped-least-squares damping (larger = more stable, slower near singularities). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK", meta = (ClampMin = "0.001"))
@@ -56,9 +64,19 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK|Home")
 	bool bApplyHomeOnBind = true;
 
-	/** Keep the EE target fixed relative to the arm's root body (the mocap base_link) instead of a
-	 *  fixed MuJoCo world pose. Lets the arm ride a moving base (e.g. the RAMMP chair) without the IK
-	 *  fighting to hold a world point. When true, target poses are expressed in the base frame. */
+	/** Joint speed while stowing (rad/s): Stow() takes each arm joint to HomeArmAngles at this rate. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK|Home", meta = (ClampMin = "0.01"))
+	float StowSpeed = 0.8f;
+
+	/** Every arm joint within this of HomeArmAngles (rad) reads as stowed: room for the wrist's servos to sag
+	 *  under gravity (the Gen3's sit about 0.05 rad off). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK|Home", meta = (ClampMin = "0.001"))
+	float StowToleranceRad = 0.1f;
+
+	/** Keep the EE target fixed relative to the arm's root body (the mocap base_link, or the chassis of
+	 *  a base the arm is composed onto) instead of a fixed MuJoCo world pose. Lets the arm ride a moving
+	 *  base (e.g. the RAMMP chair) without the IK fighting to hold a world point. When true, target
+	 *  poses are expressed in the base frame. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK")
 	bool bTrackBaseFrame = true;
 
@@ -110,6 +128,16 @@ public:
 	UFUNCTION(BlueprintPure, Category = "EE IK")
 	bool IsTargetInitialized() const;
 
+	/** Take the arm to HomeArmAngles joint by joint (at StowSpeed, not through the IK, so it folds the way the home
+	 *  pose does), then hold its end effector there: the target re-seeds from the stowed pose. Ignored without a
+	 *  home pose for every arm joint. */
+	UFUNCTION(BlueprintCallable, Category = "EE IK|Home")
+	void Stow();
+
+	/** Every arm joint within StowToleranceRad of HomeArmAngles (false without a home pose). */
+	UFUNCTION(BlueprintPure, Category = "EE IK|Home")
+	bool IsStowed() const;
+
 	// Game-thread tick: samples the Chaos mount pose for the physics thread to smooth toward.
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
@@ -142,6 +170,7 @@ private:
 	double SmoothQuat[4] = {1, 0, 0, 0};
 	bool bSmoothInit = false;
 	TArray<int32> ArmActIds;     // arm position-actuator MuJoCo ids (order = column order)
+	TArray<double>				  ArmCmd;		 // what the arm actuators were last commanded (held when a step cannot solve)
 	TArray<int32> ArmQposAddr;   // qpos address per arm joint
 	TArray<int32> ArmDofAddr;    // qvel/dof address per arm joint (Jacobian column)
 	int32 GripActId = -1;
@@ -157,6 +186,11 @@ private:
 	double TgtQuat[4] = {1, 0, 0, 0};  // MuJoCo wxyz
 	double GripCtrl = 0.0;
 	bool bTargetInit = false;
+	bool					 bStowRequested = false; // Stow() asked; the physics step takes it up
+	bool					 bStowed = false;		 // the arm at its home pose, as of the last physics step
+
+	// Stowing (physics thread): the arm joints driven to HomeArmAngles in joint space, the IK paused.
+	bool bStowing = false;
 
 	// Apply HomeArmAngles on the first physics step (physics thread), since the engine's post-bind
 	// mj_resetData wipes any qpos we set in Bind(). Set in Bind, consumed once in ComputeAndApply.

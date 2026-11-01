@@ -2,7 +2,6 @@
 
 #include "RammsMujocoActuationBackend.h"
 #include "RammsRobotBaseComponent.h"
-#include "MuJoCo/Controllers/MjArticulationController.h"
 #include "MuJoCo/Core/AMjManager.h"
 #include "MuJoCo/Core/MjArticulation.h"
 #include "MuJoCo/Core/MjPhysicsEngine.h"
@@ -21,7 +20,6 @@ bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
 	TransmissionByMotor.Reset();
 	WarnedUnsupported.Reset();
 
-	AActor* Owner = Base.GetOwner();
 	BaseComponent = &Base;
 	Articulation = FindArticulation(Base);
 	if (!Articulation.IsValid())
@@ -32,20 +30,9 @@ bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
 	// UE owns the drive: select the internal (UI/Blueprint) control slot so
 	// staged values reach d->ctrl (0 = ZMQ/network, non-zero = UI).
 	Articulation->ControlSource = 1;
-
-	// An enabled articulation controller takes over ApplyControls for the whole
-	// articulation: URLab returns right after ComputeAndApply, so the staged
-	// slots of actuators that controller doesn't own are never applied. Nothing
-	// this backend can do about it from outside — say so loudly.
-	if (const UMjArticulationController* Controller = Articulation->FindComponentByClass<UMjArticulationController>())
-	{
-		if (Controller->bEnabled)
-		{
-			UE_LOG(LogTemp, Warning,
-				TEXT("RammsMujocoActuationBackend on '%s': articulation '%s' has an enabled %s (%s). URLab applies only that controller's ctrl while it is enabled, so motor commands routed through the base component will be ignored for actuators it does not drive. Disable it, or apply the URLab fix that merges staged controls under a controller."),
-				*Owner->GetName(), *Articulation->GetName(), *Controller->GetClass()->GetName(), *Controller->GetKindName());
-		}
-	}
+	// An articulation controller (an arm's IK on a composed robot) runs after
+	// the staged slots and overwrites only the actuators it drives, so the
+	// base's motors keep their commands under it.
 	return true;
 }
 
