@@ -136,9 +136,22 @@ void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32
 	// Arm = the joint-transmission actuators from Bindings whose joint moves the EE site: on the chain from the
 	// root down to the site's body. That is every one of them on an arm alone; on an arm composed onto a mobile
 	// base in one articulation it leaves out the base's wheels and lifts, which the IK must not drive.
+	int32 ArmRootId = -1;
+	for (int b = 0; b < m->nbody && !ArmRootBodyName.IsEmpty(); ++b)
+	{
+		if (MatchesInOwner(mj_id2name(m, mjOBJ_BODY, b), ArmRootBodyName))
+		{
+			ArmRootId = b;
+			break;
+		}
+	}
 	TSet<int32> EeChain;
 	for (int b = EeSiteId >= 0 ? m->site_bodyid[EeSiteId] : 0; b > 0; b = m->body_parentid[b])
+	{
 		EeChain.Add(b);
+		if (b == ArmRootId)
+			break; // the arm's own joints only: what carries its root belongs to the base
+	}
 	for (const FActuatorBinding& B : Bindings)
 	{
 		if (!B.Component || B.ActuatorMjID == GripActId)
@@ -152,6 +165,10 @@ void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32
 		ArmQposAddr.Add(B.QposAddr);
 		ArmDofAddr.Add(B.QvelAddr);
 	}
+	ArmCmd.Reset();
+	for (const int32 Id : ArmActIds)
+		ArmCmd.Add(d->ctrl[Id]);
+	bStowing = false;
 
 	// Base frame = the arm's root body (the direct child of worldbody above the EE site). When that
 	// root is a mocap body driven by a moving base, tracking the target in this frame keeps the EE
@@ -250,8 +267,8 @@ void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32
 		bTargetInit = false;
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("[RammsEE-IK] bound: arm actuators=%d gripper id=%d ee site=%d (%s) base body=%d track-base=%d"),
-		ArmActIds.Num(), GripActId, EeSiteId, *EndEffectorSiteName, BaseBodyId, bTrackBaseFrame ? 1 : 0);
+	UE_LOG(LogTemp, Log, TEXT("[RammsEE-IK] bound: arm actuators=%d (from root body %d) gripper id=%d ee site=%d (%s) base body=%d track-base=%d"),
+		ArmActIds.Num(), ArmRootId, GripActId, EeSiteId, *EndEffectorSiteName, BaseBodyId, bTrackBaseFrame ? 1 : 0);
 }
 
 void URammsMjEndEffectorController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*/)
@@ -271,6 +288,50 @@ void URammsMjEndEffectorController::ComputeAndApply(mjModel* m, mjData* d, uint8
 		}
 		mj_forward(m, d);  // refresh site/body poses to the home configuration
 		bHomePending = false;
+		ArmCmd.SetNum(ArmActIds.Num());
+		for (int32 j = 0; j < ArmActIds.Num(); ++j)
+			ArmCmd[j] = HomeArmAngles[j];
+	}
+
+	// Stowing: each arm joint to its home angle at StowSpeed, the IK paused, then the target re-seeded there. Every
+	// step it is also read whether the arm is stowed.
+	const bool bHasHome = HomeArmAngles.Num() >= ArmActIds.Num();
+	bool	   bAtHome = bHasHome;
+	for (int32 j = 0; j < ArmActIds.Num() && bAtHome; ++j)
+		bAtHome = FMath::Abs(d->qpos[ArmQposAddr[j]] - (double)HomeArmAngles[j]) <= (double)StowToleranceRad;
+	double StowGrip = 0.0;
+	{
+		FScopeLock Lock(&TargetMutex);
+		if (bStowRequested && bHasHome)
+			bStowing = true;
+		bStowRequested = false;
+		bStowed = bAtHome;
+		StowGrip = GripCtrl;
+	}
+	if (bStowing)
+	{
+		const double MaxStep = (double)StowSpeed * m->opt.timestep;
+		bool		 bArrived = true;
+		bool		 bSettled = true;
+		for (int32 j = 0; j < ArmActIds.Num(); ++j)
+		{
+			const double Home = (double)HomeArmAngles[j];
+			ArmCmd[j] += FMath::Clamp(Home - ArmCmd[j], -MaxStep, MaxStep);
+			d->ctrl[ArmActIds[j]] = (mjtNum)ArmCmd[j];
+			bArrived &= ArmCmd[j] == Home;
+			bSettled &= FMath::Abs(d->qvel[ArmDofAddr[j]]) < 0.02;
+		}
+		if (GripActId >= 0 && GripActId < m->nu)
+			d->ctrl[GripActId] = (mjtNum)StowGrip;
+		// Done once commanded home and at rest there, whether or not every joint made the tolerance (a servo that
+		// sags past it would otherwise keep the IK paused for good).
+		if (bArrived && (bAtHome || bSettled))
+		{
+			bStowing = false;
+			FScopeLock Lock(&TargetMutex);
+			bTargetInit = false; // held where it stowed: re-seeded from this pose on the next step
+		}
+		return;
 	}
 
 	// Dynamic tracking base: own base_target's mocap and advance it smoothly toward the latest mount
@@ -446,7 +507,15 @@ void URammsMjEndEffectorController::ComputeAndApply(mjModel* m, mjData* d, uint8
 
 	double xsol[6];
 	if (!SolveLinear(A, err, xsol, rows))
+	{
+		// Hold what was last commanded: URLab writes the staged controls before this controller, so an arm
+		// actuator left unwritten would take its staged target instead.
+		for (int32 j = 0; j < K && j < ArmCmd.Num(); ++j)
+			d->ctrl[ArmActIds[j]] = (mjtNum)ArmCmd[j];
+		if (GripActId >= 0 && GripActId < m->nu)
+			d->ctrl[GripActId] = (mjtNum)grip;
 		return;
+	}
 
 	// dq = J^T x ; target qpos = current + StepGain*dq, clamped to joint range.
 	for (int j = 0; j < K; ++j)
@@ -462,6 +531,8 @@ void URammsMjEndEffectorController::ComputeAndApply(mjModel* m, mjData* d, uint8
 			tgtq = FMath::Clamp(tgtq, (double)m->jnt_range[jntid * 2], (double)m->jnt_range[jntid * 2 + 1]);
 		}
 		d->ctrl[ArmActIds[j]] = (mjtNum)tgtq;
+		if (j < ArmCmd.Num())
+			ArmCmd[j] = tgtq;
 	}
 
 	if (GripActId >= 0 && GripActId < m->nu)
@@ -531,6 +602,18 @@ bool URammsMjEndEffectorController::IsTargetInitialized() const
 {
 	FScopeLock Lock(&TargetMutex);
 	return bTargetInit;
+}
+
+void URammsMjEndEffectorController::Stow()
+{
+	FScopeLock Lock(&TargetMutex);
+	bStowRequested = true; // taken up by the next physics step
+}
+
+bool URammsMjEndEffectorController::IsStowed() const
+{
+	FScopeLock Lock(&TargetMutex);
+	return bStowed;
 }
 
 void URammsMjEndEffectorController::HandleSimulationReset()

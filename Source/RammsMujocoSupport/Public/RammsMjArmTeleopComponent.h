@@ -26,7 +26,9 @@ class URammsMjEndEffectorController;
  * Chaos arm's URammsEndEffectorTeleopComponent: rate axes arm.forward /
  * arm.strafe / arm.up / arm.yaw / arm.pitch / arm.roll (normalized, integrated
  * per tick at LinearSpeed / AngularSpeed), arm.resync, gripper.open /
- * gripper.close / gripper.toggle and the gripper.closed readback.
+ * gripper.close / gripper.toggle and the gripper.closed readback. arm.stow
+ * takes the arm to its controller's home pose (Stow), and the arm.stowed
+ * readback says when it is there: a curb crossing stows the arm with them.
  */
 UCLASS(ClassGroup = (Ramms), meta = (BlueprintSpawnableComponent))
 class RAMMSMUJOCOSUPPORT_API URammsMjArmTeleopComponent : public UActorComponent, public IRammsControlContributor
