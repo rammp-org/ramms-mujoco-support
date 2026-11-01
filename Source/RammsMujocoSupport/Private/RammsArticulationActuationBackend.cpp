@@ -56,6 +56,16 @@ void FRammsChaosArticulationBackend::SetCommand(FName MotorId, float Value)
 {
 	if (URammsChaosArticulationComponent* Comp = Component())
 	{
+		// A position servo on a slide takes its target in cm, as GetValue reports
+		// the joint, as on MuJoCo; the component's control stays in the MJCF's
+		// own units (m), which keyframes use. Before the build the actuator is
+		// unknown and the value is kept as given.
+		bool bSlide = false;
+		JointOf(MotorId, bSlide);
+		if (bSlide && Comp->IsPositionServo(MotorId))
+		{
+			Value *= 0.01f;
+		}
 		Comp->SetControl(MotorId, Value); // clamped to ctrlrange; kept until the build when early
 	}
 }
