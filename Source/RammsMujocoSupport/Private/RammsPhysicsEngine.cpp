@@ -222,9 +222,27 @@ void URammsPhysicsEngineSubsystem::ToChaos(AMjArticulation* Articulation)
 
 void URammsPhysicsEngineSubsystem::OnActorSpawned(AActor* Actor)
 {
-	if (AMjArticulation* Articulation = Cast<AMjArticulation>(Actor))
+	AMjArticulation* Articulation = Cast<AMjArticulation>(Actor);
+	if (!Articulation)
+	{
+		return;
+	}
+	if (Articulation->IsActorInitialized())
 	{
 		ToChaos(Articulation);
+		return;
+	}
+	// A deferred spawn (SpawnActorDeferred, Blueprint Spawn Actor) is announced before its construction
+	// script adds the Blueprint's components: convert it once those exist, so a Blueprint's own Chaos
+	// component (and its sim-control keyframe) is the one that builds.
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this, Weak = TWeakObjectPtr<AMjArticulation>(Articulation)]() {
+			if (AMjArticulation* A = Weak.Get())
+			{
+				ToChaos(A);
+			}
+		}));
 	}
 }
 

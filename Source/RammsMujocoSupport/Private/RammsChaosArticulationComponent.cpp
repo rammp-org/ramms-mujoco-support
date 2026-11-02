@@ -19,6 +19,7 @@
 #include "PhysicsEngine/BodySetup.h"
 #include "PhysicsEngine/ConstraintInstance.h"
 #include "PhysicsProxy/SingleParticlePhysicsProxy.h"
+#include "RammsPhysicsEngine.h"
 
 #include <mujoco/mujoco.h>
 
@@ -366,6 +367,7 @@ URammsChaosArticulationComponent* URammsChaosArticulationComponent::SwitchToChao
 	}
 	URammsChaosArticulationComponent* Comp = NewObject<URammsChaosArticulationComponent>(Articulation, NAME_None, RF_Transient);
 	Comp->InitialKeyframe = Keyframe;
+	Comp->bSwitchedAtRuntime = true;
 	Articulation->AddInstanceComponent(Comp);
 	Comp->RegisterComponent(); // BeginPlay runs here when the actor is already playing
 	return Comp;
@@ -374,6 +376,15 @@ URammsChaosArticulationComponent* URammsChaosArticulationComponent::SwitchToChao
 void URammsChaosArticulationComponent::BeginPlay()
 {
 	Super::BeginPlay();
+	// A level on MuJoCo keeps its articulations there, including ones spawned after it began play.
+	const UWorld*						World = GetWorld();
+	const URammsPhysicsEngineSubsystem* Engines = World ? World->GetSubsystem<URammsPhysicsEngineSubsystem>() : nullptr;
+	if (!bSwitchedAtRuntime && bSimulateWithChaos && Engines && Engines->GetEngine() == ERammsLevelPhysicsEngine::MuJoCo)
+	{
+		bSimulateWithChaos = false;
+		UE_LOG(LogRammsChaosArticulation, Log, TEXT("%s: the level runs on MuJoCo; not built on Chaos"), *GetNameSafe(GetOwner()));
+		return;
+	}
 	EnsureBuilt();
 }
 
@@ -763,6 +774,7 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 		const bool	 bLimited = M->jnt_limited[j] != 0;
 		const double Lo = M->jnt_range[2 * j], Hi = M->jnt_range[2 * j + 1];
 		J.Mid = (bLimited && J.Kind != EJointKind::Ball) ? 0.5 * (Lo + Hi) : 0.0;
+		J.HalfRange = (bLimited && J.Kind != EJointKind::Ball) ? 0.5 * (Hi - Lo) : 0.0;
 		J.bContinuous = J.Kind == EJointKind::Hinge && !bLimited;
 
 		const FTransform ParentWorld0 = Parent != INDEX_NONE ? Pose0[RootBody[Parent]] : FTransform::Identity;
@@ -1050,6 +1062,13 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 				continue;
 			}
 			FConstraintInstance& CI = *Constraints[J.Constraint];
+			// A hinge's orientation drive takes the shorter way round: it pulls toward springref only while
+			// the joint cannot get more than half a turn from it (a limited hinge whose whole range is within
+			// pi of springref). Past that it would push the wrong way, so such a spring stays a force from the
+			// callback; the damping is still the drive's.
+			J.bPassiveDamping = J.Damping > 0.0;
+			J.bPassiveSpring = J.Stiffness > 0.0
+				&& (J.Kind == EJointKind::Slide || (!J.bContinuous && FMath::Abs(J.Mid - J.SpringRef) + J.HalfRange < UE_DOUBLE_PI - 1.0e-3));
 			if (J.Kind == EJointKind::Slide)
 			{
 				CI.SetLinearDriveAccelerationMode(false);
@@ -1063,13 +1082,12 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 			{
 				CI.SetAngularDriveAccelerationMode(false);
 				CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
-				CI.SetOrientationDriveTwistAndSwing(J.Stiffness > 0.0, false);
-				CI.SetAngularVelocityDriveTwistAndSwing(J.Damping > 0.0, false);
-				SetAngularDrive(CI, J.Stiffness * 1.0e4, J.Damping * 1.0e4, 0.0f);
+				CI.SetOrientationDriveTwistAndSwing(J.bPassiveSpring, false);
+				CI.SetAngularVelocityDriveTwistAndSwing(J.bPassiveDamping, false);
+				SetAngularDrive(CI, J.bPassiveSpring ? J.Stiffness * 1.0e4 : 0.0, J.Damping * 1.0e4, 0.0f);
 				CI.SetAngularOrientationTarget(FQuat(FVector::XAxisVector, -(J.SpringRef - J.Mid)));
 				CI.SetAngularVelocityTarget(FVector::ZeroVector);
 			}
-			J.bPassiveDrive = true;
 		}
 	}
 
@@ -1090,8 +1108,8 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 			P.Origin0 = J.Origin0;
 			P.Mid = P.bHinge ? J.Mid : 0.0;
 			const double U = P.bHinge ? 1.0e4 : 1.0;		   // N.m/rad -> kg.cm^2/s^2/rad;  N/m == kg/s^2
-			P.Damping = J.bPassiveDrive ? 0.0 : J.Damping * U; // else the constraint's drive applies them
-			P.Stiffness = J.bPassiveDrive ? 0.0 : J.Stiffness * U;
+			P.Damping = J.bPassiveDamping ? 0.0 : J.Damping * U; // else the constraint's drive applies them
+			P.Stiffness = J.bPassiveSpring ? 0.0 : J.Stiffness * U;
 			P.SpringRef = P.bHinge ? J.SpringRef : J.SpringRef * 100.0;
 			P.FrictionLoss = J.FrictionLoss * (P.bHinge ? 1.0e4 : 100.0);
 			Callback->Joints.Add(P);
