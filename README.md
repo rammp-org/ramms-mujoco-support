@@ -22,7 +22,8 @@ From the compiled model the component builds:
 | hinge, slide, ball | a constraint with the joint's range. An asymmetric range is centred by offsetting the child frame by mid-range |
 | `<connect>` / `<weld>` between bodies | a point / locked constraint (closes kinematic loops) |
 | position servo (`<position>`, or `<general>` with an affine bias), velocity servo | a force-mode drive with the MJCF's kp / kv and its force range as the limit (× `ServoForceLimitScale`, default 1) |
-| `<motor>`, joint `damping`, `stiffness`, `frictionloss` | forces applied by a physics-rate callback (`ISimCallbackObject`), equal and opposite on the joint's two bodies |
+| joint `damping`, `stiffness` (and `springref`) on a joint no actuator drives | the joint constraint's own drives, solved implicitly (`bPassiveJointDrives`, default on): a velocity drive for the damping, a position drive toward `springref` for the spring. Explicit forces at Chaos' 10 ms step ring and blow up on light parts (a 35 g knob, a 6 g button) |
+| `<motor>`, damping, stiffness and `frictionloss` on an actuated joint | forces applied by a physics-rate callback (`ISimCallbackObject`), equal and opposite on the joint's two bodies |
 | fixed tendon actuator (the 2F-85's) | per-joint drives with coefficient-scaled gains |
 | parent/child, `<exclude>`, contype/conaffinity | `SelfCollision = MuJoCo`: those pairs don't collide, everything else does; when that leaves no pair (the usual robot MJCF: every part contype 1, conaffinity 0) it is `Off`. `Off`: no part collides with another (RobotSelf channel) |
 
@@ -37,7 +38,12 @@ frame. The URLab components lose their collision (the Chaos bodies answer querie
 following them cheap. Controls use the MJCF actuator's own ctrl units (`SetControl`, `ApplyKeyframeControls`), so a
 keyframe's ctrl vector gives the same stance on either engine. `GetJointPosition` / `GetJointVelocity`
 report joints in MuJoCo's units, as of the latest physics step (async physics interpolates the bodies'
-game-thread transforms a step or more behind), with an unlimited hinge (a wheel) counted past ±π.
+game-thread transforms a step or more behind), with an unlimited hinge (a wheel) counted past ±π and a
+limited one measured about its mid-range (a washer door's 0..180° reads 180°, not -180°).
+
+Chaos scales an angular drive's stiffness and damping by `p.Chaos.JointConstraint.AngularDriveStiffnessScale`
+/ `...DampingScale` (1.5 by default) where a linear drive's are not; the component divides that back out,
+so an MJCF kp or damping means the same thing on both engines.
 
 ### Robot controllers on Chaos
 
@@ -72,6 +78,26 @@ Not carried:
 - a second joint in one body
 - geoms that exist only in the compiled model
 
-The level must not also have an `AAMjManager`, or MuJoCo simulates the articulation too. Tests and
-measurements are in ramms-sim's `Scripts/pie_tests/chaos_articulation/` and
+## Choosing the engine per level
+
+The same articulation assets run on either engine; the level picks which. Put an
+**`ARammsPhysicsSettings`** actor in the level and set its **Engine**:
+
+| Engine | at BeginPlay |
+|---|---|
+| **Auto** (default) | the level as placed: MuJoCo simulates what its `AAMjManager` compiles, Chaos what carries an active `URammsChaosArticulationComponent` (such a level must not also have an `AAMjManager`, or MuJoCo simulates that articulation too). A level with no settings actor behaves the same, so existing levels are unchanged |
+| **MuJoCo** | spawns an `AAMjManager` when the level has none (and starts it unless `bStartMuJoCoRunning` is off), turns off every Chaos articulation component, and, when the level has no static MuJoCo geometry (`UMjQuickConvertComponent` with Static, or a heightfield) and `bMuJoCoGround` is on, adds a hidden static slab at the floor under the articulations so they have something to stand on |
+| **Chaos** | removes every `AAMjManager` before it compiles and switches every articulation to Chaos (`SwitchToChaos`, starting in its `URammsMjSimControlComponent::InitialKeyframe` when it has one), including ones spawned later |
+
+A run overrides the level with `-RammsPhysics=MuJoCo|Chaos|Auto` on the command line or the
+`ramms.Physics.Engine` console variable (the command line wins); `URammsPhysicsEngineSubsystem::GetEngine()`
+says which engine the level ended up on, and the log names it (`LogRammsPhysicsEngine: Chaos simulates the
+level's 9 articulation(s)`).
+
+Self-collision: Chaos never collides a joint's two bodies. MuJoCo filters the same pair only when the
+parent moves; a body hinged to a base welded to the world (a cabinet's door, a bin's lid) collides with
+it unless the MJCF `<exclude>`s the pair. RammsWorldGen's `Tools/simready_mjcf.py` writes those
+`<exclude>`s, so its SimReady models open and close alike on both engines.
+
+Tests and measurements are in ramms-sim's `Scripts/pie_tests/chaos_articulation/` and
 `doc/chaos_physics_backend_plan.md`.

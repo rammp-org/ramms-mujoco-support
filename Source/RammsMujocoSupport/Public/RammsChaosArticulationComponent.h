@@ -136,6 +136,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation")
 	bool bJointMassConditioning = false;
 
+	/** Apply a passive joint's damping and spring with its constraint's drive (implicit, stable on light
+	 *  parts) rather than as forces from the physics-rate callback. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation")
+	bool bPassiveJointDrives = true;
+
 	/** Sides of the convex polygon a cylinder geom (a wheel) becomes; Chaos has no cylinder. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation", meta = (ClampMin = "8", ClampMax = "128"))
 	int32 CylinderSides = 48;
@@ -323,6 +328,7 @@ private:
 		double	   Mid = 0.0;															// centre of the range (rad or m)
 		int32	   Constraint = INDEX_NONE;												// into Constraints
 		double	   Damping = 0.0, Stiffness = 0.0, SpringRef = 0.0, FrictionLoss = 0.0; // MJCF units
+		bool	   bPassiveDrive = false;												// no actuator: damping and spring are the constraint's drive
 		bool	   bContinuous = false;													// an unlimited hinge (a wheel): its angle is counted past +-pi
 	};
 
