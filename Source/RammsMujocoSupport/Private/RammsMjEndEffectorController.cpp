@@ -170,11 +170,17 @@ void URammsMjEndEffectorController::Bind(mjModel* m, mjData* d, const TMap<int32
 		ArmCmd.Add(d->ctrl[Id]);
 	bStowing = false;
 
-	// Base frame = the arm's root body (the direct child of worldbody above the EE site). When that
-	// root is a mocap body driven by a moving base, tracking the target in this frame keeps the EE
-	// fixed relative to the base instead of the MuJoCo world.
+	// Base frame = what carries the arm. Mounted on a robot (its root under another body): that body, so the
+	// target rides it -- a seat that moves on the chassis included (held in the chassis frame instead, a seat
+	// settling or tilting would make the IK unfold the arm to keep the EE where it was). An arm alone: its root body
+	// (the direct child of worldbody above the EE site); when that root is a mocap body driven by a moving base,
+	// tracking the target in this frame keeps the EE fixed relative to the base instead of the MuJoCo world.
 	BaseBodyId = -1;
-	if (EeSiteId >= 0)
+	if (ArmRootId > 0 && m->body_parentid[ArmRootId] > 0)
+	{
+		BaseBodyId = m->body_parentid[ArmRootId];
+	}
+	else if (EeSiteId >= 0)
 	{
 		int b = m->site_bodyid[EeSiteId];
 		while (b > 0 && m->body_parentid[b] != 0)
