@@ -73,10 +73,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK|Home", meta = (ClampMin = "0.001"))
 	float StowToleranceRad = 0.1f;
 
-	/** Keep the EE target fixed relative to the arm's root body (the mocap base_link, or the chassis of
-	 *  a base the arm is composed onto) instead of a fixed MuJoCo world pose. Lets the arm ride a moving
-	 *  base (e.g. the RAMMP chair) without the IK fighting to hold a world point. When true, target
-	 *  poses are expressed in the base frame. */
+	/** Keep the EE target fixed relative to what carries the arm (the body its root, ArmRootBodyName, is
+	 *  mounted on -- the RAMMP seat, which moves on Gen2's chassis -- or, for an arm alone, its mocap
+	 *  base_link) instead of a fixed MuJoCo world pose. Lets the arm ride a moving base (e.g. the RAMMP
+	 *  chair) without the IK fighting to hold a world point. When true, target poses are expressed in the
+	 *  base frame. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "EE IK")
 	bool bTrackBaseFrame = true;
 
