@@ -96,7 +96,8 @@ class RAMMSMUJOCOSUPPORT_API URammsChaosArticulationComponent : public UActorCom
 public:
 	URammsChaosArticulationComponent();
 
-	/** Build and simulate with Chaos at BeginPlay. Off leaves the articulation to MuJoCo. */
+	/** Build and simulate with Chaos at BeginPlay. Off leaves the articulation to MuJoCo, and so does a level
+	 *  whose ARammsPhysicsSettings (or run override) picks MuJoCo, unless SwitchToChaos added the component. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation")
 	bool bSimulateWithChaos = true;
 
@@ -135,6 +136,11 @@ public:
 	 *  connects, trading a drive's accuracy for stability. Off halves the Gen3 shoulder's sag. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation")
 	bool bJointMassConditioning = false;
+
+	/** Apply a passive joint's damping and spring with its constraint's drive (implicit, stable on light
+	 *  parts) rather than as forces from the physics-rate callback. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation")
+	bool bPassiveJointDrives = true;
 
 	/** Sides of the convex polygon a cylinder geom (a wheel) becomes; Chaos has no cylinder. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Chaos Articulation", meta = (ClampMin = "8", ClampMax = "128"))
@@ -321,8 +327,11 @@ private:
 		FQuat	   Rel0 = FQuat::Identity;												// parent^-1 * child at q = 0
 		FVector	   Origin0 = FVector::ZeroVector;										// child origin in the parent frame at q = 0 (cm)
 		double	   Mid = 0.0;															// centre of the range (rad or m)
+		double	   HalfRange = 0.0;														// half the range, 0 when unlimited
 		int32	   Constraint = INDEX_NONE;												// into Constraints
 		double	   Damping = 0.0, Stiffness = 0.0, SpringRef = 0.0, FrictionLoss = 0.0; // MJCF units
+		bool	   bPassiveDamping = false;												// no actuator: the damping is the constraint's velocity drive
+		bool	   bPassiveSpring = false;												// and the spring its position drive
 		bool	   bContinuous = false;													// an unlimited hinge (a wheel): its angle is counted past +-pi
 	};
 
@@ -378,4 +387,5 @@ private:
 	FRammsChaosArticulationCallback* Callback = nullptr;
 	bool							 bBuilt = false;
 	FString							 BuildError;
+	bool							 bSwitchedAtRuntime = false; // added by SwitchToChaos: builds whatever engine the level chose
 };

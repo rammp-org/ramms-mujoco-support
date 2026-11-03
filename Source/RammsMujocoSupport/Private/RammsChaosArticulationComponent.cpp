@@ -2,6 +2,7 @@
 
 #include "RammsChaosArticulationComponent.h"
 
+#include "Chaos/ChaosConstraintSettings.h"
 #include "Chaos/SimCallbackObject.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -18,10 +19,32 @@
 #include "PhysicsEngine/BodySetup.h"
 #include "PhysicsEngine/ConstraintInstance.h"
 #include "PhysicsProxy/SingleParticlePhysicsProxy.h"
+#include "RammsPhysicsEngine.h"
 
 #include <mujoco/mujoco.h>
 
 DEFINE_LOG_CATEGORY_STATIC(LogRammsChaosArticulation, Log, All);
+
+namespace
+{
+	/** FConstraintInstance's angular drive params in N.m-derived Unreal units, as Chaos will apply them.
+	 *  Unreal scales angular drive stiffness and damping on their way to Chaos
+	 *  (p.Chaos.JointConstraint.AngularDrive{Stiffness,Damping}Scale, 1.5 by default); this undoes it, so an
+	 *  MJCF kp, kv or damping means what it says. Linear drives are not scaled (1.0 by default, also undone). */
+	void SetAngularDrive(FConstraintInstance& CI, double Stiffness, double Damping, double MaxForce)
+	{
+		const double KS = Chaos::ConstraintSettings::AngularDriveStiffnessScale();
+		const double KD = Chaos::ConstraintSettings::AngularDriveDampingScale();
+		CI.SetAngularDriveParams((float)(KS > 0.0 ? Stiffness / KS : Stiffness), (float)(KD > 0.0 ? Damping / KD : Damping), (float)MaxForce);
+	}
+
+	void SetLinearDrive(FConstraintInstance& CI, double Stiffness, double Damping, double MaxForce)
+	{
+		const double KS = Chaos::ConstraintSettings::LinearDriveStiffnessScale();
+		const double KD = Chaos::ConstraintSettings::LinearDriveDampingScale();
+		CI.SetLinearDriveParams((float)(KS > 0.0 ? Stiffness / KS : Stiffness), (float)(KD > 0.0 ? Damping / KD : Damping), (float)MaxForce);
+	}
+} // namespace
 
 // ---------------------------------------------------------------------------------------------- //
 // Physics-rate forces: torque motors, joint damping, stiffness and friction loss.
@@ -45,6 +68,7 @@ public:
 		FVector				AxisInParent = FVector::XAxisVector;
 		FQuat				Rel0 = FQuat::Identity;
 		FVector				Origin0 = FVector::ZeroVector;
+		double				Mid = 0.0; // a hinge's mid-range: its angle is read within +-pi of it
 		// Unreal units: kg.cm^2/s^2 per rad (hinge) or kg/s^2 (slide), and so on.
 		double Damping = 0.0, Stiffness = 0.0, SpringRef = 0.0, FrictionLoss = 0.0;
 		double Effort = 0.0;
@@ -96,7 +120,7 @@ public:
 		if (J.bHinge)
 		{
 			const FQuat D = (Rp.Inverse() * FQuat(C->R())) * J.Rel0.Inverse();
-			Q = FMath::UnwindRadians(2.0 * FMath::Atan2(FVector(D.X, D.Y, D.Z) | J.AxisInParent, D.W));
+			Q = J.Mid + FMath::UnwindRadians(2.0 * FMath::Atan2(FVector(D.X, D.Y, D.Z) | J.AxisInParent, D.W) - J.Mid);
 			Qd = (FVector(C->W()) - Wp) | Axis;
 		}
 		else
@@ -343,6 +367,7 @@ URammsChaosArticulationComponent* URammsChaosArticulationComponent::SwitchToChao
 	}
 	URammsChaosArticulationComponent* Comp = NewObject<URammsChaosArticulationComponent>(Articulation, NAME_None, RF_Transient);
 	Comp->InitialKeyframe = Keyframe;
+	Comp->bSwitchedAtRuntime = true;
 	Articulation->AddInstanceComponent(Comp);
 	Comp->RegisterComponent(); // BeginPlay runs here when the actor is already playing
 	return Comp;
@@ -351,6 +376,15 @@ URammsChaosArticulationComponent* URammsChaosArticulationComponent::SwitchToChao
 void URammsChaosArticulationComponent::BeginPlay()
 {
 	Super::BeginPlay();
+	// A level on MuJoCo keeps its articulations there, including ones spawned after it began play.
+	const UWorld*						World = GetWorld();
+	const URammsPhysicsEngineSubsystem* Engines = World ? World->GetSubsystem<URammsPhysicsEngineSubsystem>() : nullptr;
+	if (!bSwitchedAtRuntime && bSimulateWithChaos && Engines && Engines->GetEngine() == ERammsLevelPhysicsEngine::MuJoCo)
+	{
+		bSimulateWithChaos = false;
+		UE_LOG(LogRammsChaosArticulation, Log, TEXT("%s: the level runs on MuJoCo; not built on Chaos"), *GetNameSafe(GetOwner()));
+		return;
+	}
 	EnsureBuilt();
 }
 
@@ -740,6 +774,7 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 		const bool	 bLimited = M->jnt_limited[j] != 0;
 		const double Lo = M->jnt_range[2 * j], Hi = M->jnt_range[2 * j + 1];
 		J.Mid = (bLimited && J.Kind != EJointKind::Ball) ? 0.5 * (Lo + Hi) : 0.0;
+		J.HalfRange = (bLimited && J.Kind != EJointKind::Ball) ? 0.5 * (Hi - Lo) : 0.0;
 		J.bContinuous = J.Kind == EJointKind::Hinge && !bLimited;
 
 		const FTransform ParentWorld0 = Parent != INDEX_NONE ? Pose0[RootBody[Parent]] : FTransform::Identity;
@@ -992,7 +1027,7 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 					CI.SetLinearDriveAccelerationMode(false);
 					CI.SetLinearPositionDrive(bPos, false, false);
 					CI.SetLinearVelocityDrive(Kv > 0.0, false, false);
-					CI.SetLinearDriveParams(Kp, Kv, FMax * 100.0);
+					SetLinearDrive(CI, Kp, Kv, FMax * 100.0);
 				}
 				else
 				{
@@ -1000,11 +1035,60 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 					CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
 					CI.SetOrientationDriveTwistAndSwing(bPos, false);
 					CI.SetAngularVelocityDriveTwistAndSwing(Kv > 0.0, false);
-					CI.SetAngularDriveParams(Kp * 1.0e4, Kv * 1.0e4, FMax * 1.0e4);
+					SetAngularDrive(CI, Kp * 1.0e4, Kv * 1.0e4, FMax * 1.0e4);
 				}
 			}
 		}
 		ActuatorByName.Add(Act.Name, Actuators.Add(Act));
+	}
+
+	// Passive joints (no actuator moves them): damping and a spring are the joint constraint's own drive,
+	// which the solver applies implicitly. As forces from the callback they are explicit, and unstable on
+	// a light part: a range knob (35 g) with 0.002 N.m.s damping at Chaos' 10 ms step, a 6 g sprung button.
+	{
+		TSet<int32> Actuated;
+		for (const FActuator& Act : Actuators)
+		{
+			for (const TPair<int32, double>& JC : Act.Joints)
+			{
+				Actuated.Add(JC.Key);
+			}
+		}
+		for (int32 j = 0; j < Joints.Num(); ++j)
+		{
+			FJoint& J = Joints[j];
+			if (!bPassiveJointDrives || Actuated.Contains(j) || J.Kind == EJointKind::Ball || (J.Damping <= 0.0 && J.Stiffness <= 0.0))
+			{
+				continue;
+			}
+			FConstraintInstance& CI = *Constraints[J.Constraint];
+			// A hinge's orientation drive takes the shorter way round: it pulls toward springref only while
+			// the joint cannot get more than half a turn from it (a limited hinge whose whole range is within
+			// pi of springref). Past that it would push the wrong way, so such a spring stays a force from the
+			// callback; the damping is still the drive's.
+			J.bPassiveDamping = J.Damping > 0.0;
+			J.bPassiveSpring = J.Stiffness > 0.0
+				&& (J.Kind == EJointKind::Slide || (!J.bContinuous && FMath::Abs(J.Mid - J.SpringRef) + J.HalfRange < UE_DOUBLE_PI - 1.0e-3));
+			if (J.Kind == EJointKind::Slide)
+			{
+				CI.SetLinearDriveAccelerationMode(false);
+				CI.SetLinearPositionDrive(J.Stiffness > 0.0, false, false);
+				CI.SetLinearVelocityDrive(J.Damping > 0.0, false, false);
+				SetLinearDrive(CI, J.Stiffness, J.Damping, 0.0f);							   // N/m == kg/s^2, N.s/m == kg/s
+				CI.SetLinearPositionTarget(FVector(-(J.SpringRef - J.Mid) * 100.0, 0.0, 0.0)); // the drive's sense, as for a hinge
+				CI.SetLinearVelocityTarget(FVector::ZeroVector);
+			}
+			else
+			{
+				CI.SetAngularDriveAccelerationMode(false);
+				CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
+				CI.SetOrientationDriveTwistAndSwing(J.bPassiveSpring, false);
+				CI.SetAngularVelocityDriveTwistAndSwing(J.bPassiveDamping, false);
+				SetAngularDrive(CI, J.bPassiveSpring ? J.Stiffness * 1.0e4 : 0.0, J.Damping * 1.0e4, 0.0f);
+				CI.SetAngularOrientationTarget(FQuat(FVector::XAxisVector, -(J.SpringRef - J.Mid)));
+				CI.SetAngularVelocityTarget(FVector::ZeroVector);
+			}
+		}
 	}
 
 	// 8. The physics-rate callback.
@@ -1022,9 +1106,10 @@ bool URammsChaosArticulationComponent::Build(FString& OutError)
 			P.AxisInParent = J.AxisInParent;
 			P.Rel0 = J.Rel0;
 			P.Origin0 = J.Origin0;
-			const double U = P.bHinge ? 1.0e4 : 1.0; // N.m/rad -> kg.cm^2/s^2/rad;  N/m == kg/s^2
-			P.Damping = J.Damping * U;
-			P.Stiffness = J.Stiffness * U;
+			P.Mid = P.bHinge ? J.Mid : 0.0;
+			const double U = P.bHinge ? 1.0e4 : 1.0;		   // N.m/rad -> kg.cm^2/s^2/rad;  N/m == kg/s^2
+			P.Damping = J.bPassiveDamping ? 0.0 : J.Damping * U; // else the constraint's drive applies them
+			P.Stiffness = J.bPassiveSpring ? 0.0 : J.Stiffness * U;
 			P.SpringRef = P.bHinge ? J.SpringRef : J.SpringRef * 100.0;
 			P.FrictionLoss = J.FrictionLoss * (P.bHinge ? 1.0e4 : 100.0);
 			Callback->Joints.Add(P);
@@ -1348,7 +1433,7 @@ bool URammsChaosArticulationComponent::SetVelocityDrive(FName Actuator, double T
 				CI.SetLinearPositionDrive(false, false, false);
 				CI.SetLinearVelocityDrive(true, false, false);
 			}
-			CI.SetLinearDriveParams(0.0f, Damping, Limit > 0.0 ? Limit * 100.0 : 0.0);
+			SetLinearDrive(CI, 0.0f, Damping, Limit > 0.0 ? Limit * 100.0 : 0.0);
 			CI.SetLinearVelocityTarget(FVector(-Rate * 100.0, 0.0, 0.0)); // the drive's sense, as for a hinge
 		}
 		else
@@ -1360,7 +1445,7 @@ bool URammsChaosArticulationComponent::SetVelocityDrive(FName Actuator, double T
 				CI.SetOrientationDriveTwistAndSwing(false, false);
 				CI.SetAngularVelocityDriveTwistAndSwing(true, false);
 			}
-			CI.SetAngularDriveParams(0.0f, Damping * 1.0e4, Limit > 0.0 ? Limit * 1.0e4 : 0.0);
+			SetAngularDrive(CI, 0.0f, Damping * 1.0e4, Limit > 0.0 ? Limit * 1.0e4 : 0.0);
 			CI.SetAngularVelocityTarget(FVector(-Rate / (2.0 * UE_DOUBLE_PI), 0.0, 0.0)); // rev/s, the drive's sense
 		}
 	}
@@ -1492,7 +1577,7 @@ bool URammsChaosArticulationComponent::SetMotorBrake(FName Actuator, bool bEngag
 			CI.SetLinearDriveAccelerationMode(false);
 			CI.SetLinearPositionDrive(true, false, false);
 			CI.SetLinearVelocityDrive(true, false, false);
-			CI.SetLinearDriveParams(Most / 0.1, Most / 1.0, Limit > 0.0 ? Limit * 100.0 : 0.0); // per cm, per cm/s
+			SetLinearDrive(CI, Most / 0.1, Most / 1.0, Limit > 0.0 ? Limit * 100.0 : 0.0); // per cm, per cm/s
 			// The drive's sense, as for a hinge.
 			CI.SetLinearPositionTarget(FVector(-(Q - J.Mid) * 100.0, 0.0, 0.0));
 			CI.SetLinearVelocityTarget(FVector::ZeroVector);
@@ -1503,7 +1588,7 @@ bool URammsChaosArticulationComponent::SetMotorBrake(FName Actuator, bool bEngag
 			CI.SetAngularDriveMode(EAngularDriveMode::TwistAndSwing);
 			CI.SetOrientationDriveTwistAndSwing(true, false);
 			CI.SetAngularVelocityDriveTwistAndSwing(true, false);
-			CI.SetAngularDriveParams(Most / 0.02 * 1.0e4, Most / 0.2 * 1.0e4, Limit > 0.0 ? Limit * 1.0e4 : 0.0);
+			SetAngularDrive(CI, Most / 0.02 * 1.0e4, Most / 0.2 * 1.0e4, Limit > 0.0 ? Limit * 1.0e4 : 0.0);
 			CI.SetAngularOrientationTarget(FQuat(FVector::XAxisVector, -(Q - J.Mid)));
 			CI.SetAngularVelocityTarget(FVector::ZeroVector);
 		}
@@ -1669,7 +1754,7 @@ bool URammsChaosArticulationComponent::MeasureJoint(const FJoint& J, double& Out
 	else
 	{
 		const FQuat Dq = (Xp.GetRotation().Inverse() * Xc.GetRotation()) * J.Rel0.Inverse();
-		OutQ = FMath::UnwindRadians(2.0 * FMath::Atan2(FVector(Dq.X, Dq.Y, Dq.Z) | J.AxisInParent, Dq.W));
+		OutQ = J.Mid + FMath::UnwindRadians(2.0 * FMath::Atan2(FVector(Dq.X, Dq.Y, Dq.Z) | J.AxisInParent, Dq.W) - J.Mid);
 		OutQd = (C->GetPhysicsAngularVelocityInRadians() - Wp) | Axis;
 	}
 	return true;
