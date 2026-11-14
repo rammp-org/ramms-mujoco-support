@@ -41,6 +41,9 @@ public class RammsMujocoSupport : ModuleRules
 			"PhysicsCore",
 			"Chaos",
 			"ChaosCore",
+			// The world-gen export test reads a piece's built mesh (UDynamicMesh).
+			"GeometryCore",
+			"GeometryFramework",
 		});
 	}
 }

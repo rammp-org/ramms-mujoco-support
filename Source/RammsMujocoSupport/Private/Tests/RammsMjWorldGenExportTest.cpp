@@ -33,7 +33,7 @@
 namespace RammsMjWorldGenExportTest
 {
 	/** A throwaway game world with a MuJoCo manager, torn down on scope exit. */
-	struct FScene
+	struct FExportScene
 	{
 		UWorld*		 World = nullptr;
 		AAMjManager* Manager = nullptr;
@@ -67,7 +67,7 @@ namespace RammsMjWorldGenExportTest
 			return World->SpawnActor<T>(T::StaticClass(), Xf, SP);
 		}
 
-		~FScene()
+		~FExportScene()
 		{
 			if (Manager && Manager->PhysicsEngine)
 			{
@@ -109,7 +109,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRammsMjWorldGenExportTest, "Ramms.MuJoCo.World
 bool FRammsMjWorldGenExportTest::RunTest(const FString& Parameters)
 {
 	using namespace RammsMjWorldGenExportTest;
-	FScene Scene;
+	FExportScene Scene;
 	if (!TestTrue(TEXT("world opens"), Scene.Open()))
 	{
 		AddError(Scene.LastError);
