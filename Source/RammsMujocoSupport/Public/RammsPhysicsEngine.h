@@ -45,11 +45,17 @@ public:
 	bool bStartMuJoCoRunning = true;
 
 	/** On MuJoCo, when the level gives MuJoCo no static geometry of its own (no UMjQuickConvertComponent
-	 *  marked Static, no heightfield), add a flat ground at the floor under the articulations so a mobile
-	 *  robot stands. Walls, curbs and furniture are not converted; a fixed object (a SimReady fridge) needs
-	 *  none of it. */
+	 *  marked Static, no heightfield, no exported generated world), add a flat ground at the floor under the
+	 *  articulations so a mobile robot stands. Walls, curbs and furniture are not converted; a fixed object (a
+	 *  SimReady fridge) needs none of it. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ramms|Physics")
 	bool bMuJoCoGround = true;
+
+	/** On MuJoCo, export each generated world (ARammsWorldGenerator) exactly, as MuJoCo world geoms
+	 *  (ARammsMjWorldGenContributor): curbs, ramps, walls and props as boxes, hulls and height fields. The
+	 *  console's ramms.mj.WorldShapes overrides it. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ramms|Physics")
+	bool bMuJoCoWorldShapes = true;
 };
 
 /**

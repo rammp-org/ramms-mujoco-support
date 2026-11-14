@@ -25,6 +25,10 @@ public class RammsMujocoSupport : ModuleRules
 			// cross-plugin actuation-backend registry we register into at startup,
 			// and IRammsControlContributor (inherited by public headers here).
 			"RammsCore",
+			// Generated worlds' collision shapes (RammsCollisionShapes.h), exported to MuJoCo by
+			// ARammsMjWorldGenContributor, whose public header names the generator's manifest. RammsWorldGen
+			// itself stays free of URLab.
+			"RammsWorldGen",
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]

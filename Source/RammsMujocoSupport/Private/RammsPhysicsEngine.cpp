@@ -15,6 +15,8 @@
 #include "MuJoCo/Core/MjArticulation.h"
 #include "RammsChaosArticulationComponent.h"
 #include "RammsMjSimControlComponent.h"
+#include "RammsMjWorldGenContributor.h"
+#include "RammsWorldGenerator.h"
 #include "TimerManager.h"
 #include "UObject/UObjectIterator.h"
 
@@ -22,6 +24,79 @@ DEFINE_LOG_CATEGORY_STATIC(LogRammsPhysicsEngine, Log, All);
 
 static TAutoConsoleVariable<FString> CVarRammsPhysicsEngine(TEXT("ramms.Physics.Engine"), TEXT(""),
 	TEXT("Physics engine for the URLab articulations of the next level started: Chaos, MuJoCo, or empty for the level's ARammsPhysicsSettings."));
+
+static TAutoConsoleVariable<int32> CVarRammsMjWorldShapes(TEXT("ramms.mj.WorldShapes"), 1,
+	TEXT("Export a generated world (ARammsWorldGenerator) to MuJoCo as exact world geoms when a level runs on MuJoCo: ")
+		TEXT("0 never; 1 unless the level's ARammsPhysicsSettings turns it off or the level samples its terrain with an ")
+			TEXT("AMjHeightfieldActor (the two together would round every curb face again); 2 always. Read when a level starts."));
+
+namespace
+{
+	/**
+	 * One ARammsMjWorldGenContributor per world generator the level does not already export, so MuJoCo sees the
+	 * generated world exactly. Returns how many were added.
+	 */
+	int32 AddWorldGenContributors(UWorld& World)
+	{
+		const int32 Mode = CVarRammsMjWorldShapes.GetValueOnGameThread();
+		if (Mode <= 0 || !TActorIterator<ARammsWorldGenerator>(&World))
+		{
+			return 0;
+		}
+		if (Mode == 1)
+		{
+			for (TActorIterator<ARammsPhysicsSettings> It(&World); It; ++It)
+			{
+				if (!It->bMuJoCoWorldShapes)
+				{
+					UE_LOG(LogRammsPhysicsEngine, Log, TEXT("%s: the generated world is not exported to MuJoCo (ARammsPhysicsSettings)"), *World.GetMapName());
+					return 0;
+				}
+				break;
+			}
+			if (TActorIterator<AMjHeightfieldActor>(&World))
+			{
+				UE_LOG(LogRammsPhysicsEngine, Warning,
+					TEXT("%s: the level samples its terrain with an AMjHeightfieldActor, so the generated world is not exported to MuJoCo exactly ")
+						TEXT("(the field would still turn each curb face into a slope). Remove the heightfield actor, or set ramms.mj.WorldShapes 2 to export both."),
+					*World.GetMapName());
+				return 0;
+			}
+		}
+		TSet<const ARammsWorldGenerator*> Covered;
+		for (TActorIterator<ARammsMjWorldGenContributor> It(&World); It; ++It)
+		{
+			Covered.Add(It->Generator.Get());
+		}
+		int32 Added = 0;
+		for (TActorIterator<ARammsWorldGenerator> It(&World); It; ++It)
+		{
+			ARammsWorldGenerator* Generator = *It;
+			if (Covered.Contains(Generator))
+			{
+				continue;
+			}
+			// Deferred, so the generator is set before its BeginPlay binds to the generator's OnWorldGenerated.
+			ARammsMjWorldGenContributor* Contributor = World.SpawnActorDeferred<ARammsMjWorldGenContributor>(
+				ARammsMjWorldGenContributor::StaticClass(), FTransform::Identity, nullptr, nullptr, ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+			if (!Contributor)
+			{
+				continue;
+			}
+			Contributor->Generator = Generator;
+			Contributor->FinishSpawning(FTransform::Identity);
+#if WITH_EDITOR
+			Contributor->SetActorLabel(FString::Printf(TEXT("MuJoCoWorld_%s"), *Generator->GetName()));
+#endif
+			++Added;
+		}
+		if (Added > 0)
+		{
+			UE_LOG(LogRammsPhysicsEngine, Log, TEXT("%s: %d generated world(s) exported to MuJoCo as world geoms"), *World.GetMapName(), Added);
+		}
+		return Added;
+	}
+} // namespace
 
 namespace
 {
@@ -93,6 +168,11 @@ void URammsPhysicsEngineSubsystem::OnWorldBeginPlay(UWorld& World)
 	Engine = ResolveEngine(World, &bStartRunning, &bGround);
 	if (Engine == ERammsLevelPhysicsEngine::Auto)
 	{
+		// As placed: a level with its own MuJoCo manager still gets its generated world in MuJoCo.
+		if (TActorIterator<AAMjManager>(&World))
+		{
+			AddWorldGenContributors(World);
+		}
 		return;
 	}
 
@@ -136,13 +216,16 @@ void URammsPhysicsEngineSubsystem::OnWorldBeginPlay(UWorld& World)
 		SP.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 		bSpawned = World.SpawnActor<AAMjManager>(AAMjManager::StaticClass(), FTransform::Identity, SP) != nullptr;
 	}
-	const bool bGroundAdded = bGround && SpawnMuJoCoGround(World);
+	// Before the ground: a generated world that is exported is the ground.
+	const int32 Exported = AddWorldGenContributors(World);
+	const bool	bGroundAdded = bGround && SpawnMuJoCoGround(World);
 	if (bStartRunning)
 	{
 		World.GetTimerManager().SetTimer(StartTimer, FTimerDelegate::CreateUObject(this, &URammsPhysicsEngineSubsystem::TryStartMuJoCo), 0.25f, true);
 	}
-	UE_LOG(LogRammsPhysicsEngine, Log, TEXT("%s: MuJoCo simulates the level's %d articulation(s)%s%s"), *World.GetMapName(), Articulations,
-		bSpawned ? TEXT("; a MuJoCo manager was spawned") : TEXT(""), bGroundAdded ? TEXT("; a MuJoCo ground was added") : TEXT(""));
+	UE_LOG(LogRammsPhysicsEngine, Log, TEXT("%s: MuJoCo simulates the level's %d articulation(s)%s%s%s"), *World.GetMapName(), Articulations,
+		bSpawned ? TEXT("; a MuJoCo manager was spawned") : TEXT(""), Exported > 0 ? TEXT("; the generated world is exported") : TEXT(""),
+		bGroundAdded ? TEXT("; a MuJoCo ground was added") : TEXT(""));
 }
 
 bool URammsPhysicsEngineSubsystem::SpawnMuJoCoGround(UWorld& World)
@@ -158,6 +241,13 @@ bool URammsPhysicsEngineSubsystem::SpawnMuJoCoGround(UWorld& World)
 	if (TActorIterator<AMjHeightfieldActor>(&World))
 	{
 		return false;
+	}
+	for (TActorIterator<ARammsMjWorldGenContributor> It(&World); It; ++It)
+	{
+		if (It->SuppliesGround())
+		{
+			return false; // the generated world, exactly
+		}
 	}
 	// The floor under the articulations: the lowest surface a trace from each one's origin meets.
 	double Ground = 0.0, SumX = 0.0, SumY = 0.0;
