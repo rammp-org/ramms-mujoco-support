@@ -129,23 +129,31 @@ LogRammsMjWorldGen: <contributor>: exported <n> shapes as <n> geoms (<b> boxes, 
 LogRammsMjWorldGen: <contributor>: <n> world geoms in the compiled model; compiled and bound <t> ms after authoring
 ```
 
-**Friction** is per surface (`SurfaceFriction`: asphalt, concrete and curb 0.9, brick 0.8, cobble 0.7, grass,
-dirt, gravel and wood 0.6, metal 0.5, mud 0.4, glass 0.4, water 0.3, anything else `DefaultFriction` 0.9),
-with priority 0 and MuJoCo's default solver parameters. Robot geoms keep their tuning: a higher-priority one
-(the omni rollers) uses its own parameters outright, and an equal-priority one takes the larger sliding
-friction of the pair, so a surface under the robot's own friction changes nothing. The flat slab this
-replaces had sliding friction 1.0.
+**Friction** is per surface (`SurfaceFriction`: asphalt, concrete and curb 1.0, brick 0.8, cobble 0.7, foliage
+0.5, grass, dirt, gravel and wood 0.6, metal 0.5, mud 0.4, glass 0.4, water 0.3). The `Default` surface (a
+shape no label or material names, which is most static meshes) and any surface the table does not list take
+`DefaultFriction`, 1.0. All with priority 0 and MuJoCo's default solver parameters. Robot geoms keep their
+tuning: a higher-priority one (the omni rollers) uses its own parameters outright, and an equal-priority one
+takes the larger sliding friction of the pair, so a surface under the robot's own friction changes nothing.
+Hard surfaces and `Default` are 1.0 because the flat slab this replaces was: a robot geom at 0.9 (RAMMP Gen2's
+`collision` class, its drive links included) gets 1.0 there, as it did on the slab. A softer surface lowers a
+contact only as far as the robot geom's own friction: RAMMP Gen1's geoms (1.0) and the omni rollers (priority 1)
+see no change anywhere, and Gen2's 0.9 geoms see 0.9 on grass, cobble or brick instead of the slab's 1.0.
 
 **When it is added.** `URammsPhysicsEngineSubsystem` places one per generator when the level runs on MuJoCo
-(Engine MuJoCo, or Auto with an `AAMjManager` in the level), unless `ARammsPhysicsSettings::bMuJoCoWorldShapes`
-is off or the level samples its terrain with an `AMjHeightfieldActor` (the two together would round the curb
-faces again; remove the heightfield). `ramms.mj.WorldShapes` overrides: 0 never, 1 as described, 2 always.
-An exported world is the ground, so the flat slab is not added. A placed contributor (or one with no
-`Generator`, which exports every procedural piece in the level) is kept as it is.
+(Engine MuJoCo, or Auto with an `AAMjManager` in the level, which the log says, since it changes what such a
+level's manager compiles), unless `ARammsPhysicsSettings::bMuJoCoWorldShapes` is off or the level samples its
+terrain with an `AMjHeightfieldActor` (the two together would round the curb faces again; remove the
+heightfield). `ramms.mj.WorldShapes` overrides: 0 never, 1 as described, 2 always. An exported world is the
+ground, so the flat slab is not added (`SuppliesGround` checks cheaply: the first piece or mesh with a shape
+answers it). A placed contributor is kept as it is, and its generator gets no second one; a contributor with no
+`Generator` exports every procedural piece in the level, so then no generator gets one. An actor MuJoCo already
+has through a `UMjQuickConvertComponent` is never exported again.
 
 **Regeneration.** The contributor binds the generator's `OnWorldGenerated` and recompiles the scene on the
 next tick (`AAMjManager::CompileModel`: robots keep their state, a failed compile keeps the old model). A
-recompile for any other reason reuses the authored spec. `ramms.mj.RecompileWorldShapes` re-exports and
+recompile for any other reason reuses the authored spec, and a queued recompile that another compile already
+served (the manager's first, another contributor's) is dropped. `ramms.mj.RecompileWorldShapes` re-exports and
 recompiles by hand (after moving pieces in PIE, or changing the radius).
 
 **Region.** `ExportRadius` (or `ramms.mj.WorldShapesRadius`, metres) keeps only what lies within that
@@ -156,5 +164,10 @@ URLab's conversion back to Unreal) over the level: boxes green, meshes cyan, hei
 MuJoCo's cell diagonals, spheres and capsules magenta; `2` draws them over everything,
 `ramms.mj.DrawWorldShapesRadius` (default 40 m around the view, 0 for all) limits them.
 
-`Ramms.MuJoCo.WorldGenExport.MatchesChaos` compiles every piece kind (and pitched, rolled pieces) and
-compares MuJoCo's own ray (`mj_ray`) with Chaos's trace of each piece: within 2 mm.
+`Ramms.MuJoCo.WorldGenExport.MatchesChaos` compiles every piece kind, ground prisms and humps included
+(and pitched, rolled and scaled pieces), and compares MuJoCo's own ray (`mj_ray`) with Chaos's trace of each
+piece: within 2 mm. `Ramms.MuJoCo.WorldGenExport.NoDoubleExport` checks that no generator gets two
+contributors (nor any, beside one with no `Generator`) and that quick-converted actors are left out.
+`Ramms.MuJoCo.WorldGenExport.SeamContacts` measures, and only reports, how far contact normals lean sideways
+where a sphere, a wheel-like cylinder and a roller pad cross the seam between two coplanar exported boxes, 2 mm
+into them: separate geoms meeting at a seam can give the far geom's edge a contact whose normal is not vertical.
