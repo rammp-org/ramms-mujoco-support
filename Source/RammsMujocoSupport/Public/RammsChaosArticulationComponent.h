@@ -283,6 +283,11 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
 	TArray<URammsChaosBodyComponent*> GetBodyComponents() const;
 
+	/** The Chaos body that carries a URLab body component of this articulation, and that component's frame in the
+	 *  Chaos body's (Unreal units: where SyncVisuals places it). False when not built or BodyComponent is none of
+	 *  its bodies. */
+	bool FindChaosBody(const USceneComponent* BodyComponent, URammsChaosBodyComponent*& OutBody, FTransform& OutInBody) const;
+
 	/** Why the last build failed, empty when it did not. */
 	UFUNCTION(BlueprintPure, Category = "Chaos Articulation")
 	FString GetBuildError() const { return BuildError; }

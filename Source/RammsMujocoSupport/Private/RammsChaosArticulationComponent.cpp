@@ -1838,6 +1838,25 @@ TArray<URammsChaosBodyComponent*> URammsChaosArticulationComponent::GetBodyCompo
 	return Out;
 }
 
+bool URammsChaosArticulationComponent::FindChaosBody(const USceneComponent* BodyComponent, URammsChaosBodyComponent*& OutBody,
+	FTransform& OutInBody) const
+{
+	if (!bBuilt || BodyComponent == nullptr)
+	{
+		return false;
+	}
+	for (const FMjBodyInfo& B : MjBodies)
+	{
+		if (B.Visual.Get() == BodyComponent && Roots.IsValidIndex(B.Root) && Roots[B.Root])
+		{
+			OutBody = Roots[B.Root];
+			OutInBody = B.InRoot;
+			return true;
+		}
+	}
+	return false;
+}
+
 void URammsChaosArticulationComponent::SyncVisuals()
 {
 	// Bodies are in MuJoCo order, parents before children, so each component is placed after the one
