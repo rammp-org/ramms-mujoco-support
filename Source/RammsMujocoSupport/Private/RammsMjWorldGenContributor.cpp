@@ -615,6 +615,13 @@ void ARammsMjWorldGenContributor::BeginPlay()
 	{
 		Generator->OnWorldGenerated.AddUniqueDynamic(this, &ARammsMjWorldGenContributor::HandleWorldGenerated);
 	}
+	// Placed or spawned after the scene's first compile (which then could not see it): join with a recompile of our own.
+	const AAMjManager* Manager = AAMjManager::GetManager();
+	if (!bAuthored && Manager && Manager->GetWorld() == GetWorld() && Manager->IsInitialized())
+	{
+		UE_LOG(LogRammsMjWorldGen, Log, TEXT("%s: the MuJoCo scene compiled before this world was exported; recompiling with it"), *GetName());
+		RequestRecompile();
+	}
 }
 
 void ARammsMjWorldGenContributor::EndPlay(const EEndPlayReason::Type EndPlayReason)

@@ -101,6 +101,20 @@ namespace RammsMjWorldGenExportTest
 		});
 		return B;
 	}
+
+	/** The mesh's bounds in the piece's own frame: probes are drawn there, so a thin piece turned 45 degrees (a curb) is
+	 *  not probed mostly beside it. */
+	FBox LocalMeshBounds(const ARammsProcPiece& Piece)
+	{
+		FBox B(ForceInit);
+		Piece.MeshComponent->GetDynamicMesh()->ProcessMesh([&](const UE::Geometry::FDynamicMesh3& Mesh) {
+			for (const int32 Vid : Mesh.VertexIndicesItr())
+			{
+				B += Mesh.GetVertex(Vid);
+			}
+		});
+		return B;
+	}
 } // namespace RammsMjWorldGenExportTest
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRammsMjWorldGenExportTest, "Ramms.MuJoCo.WorldGenExport.MatchesChaos",
@@ -146,11 +160,8 @@ bool FRammsMjWorldGenExportTest::RunTest(const FString& Parameters)
 	Add(TEXT("Mound"), ERammsProcPieceKind::Mound, FRotator(0.0, 15.0, 0.0), [](ARammsProcPiece& P) { P.SizeX = 400.0; P.SizeY = 300.0; P.Rise = 40.0; });
 	Add(TEXT("Hollow pitched"), ERammsProcPieceKind::Mound, FRotator(2.0, 0.0, -1.5), [](ARammsProcPiece& P) { P.SizeX = 300.0; P.SizeY = 300.0; P.Rise = -25.0; });
 	Add(TEXT("Patch"), ERammsProcPieceKind::Patch, FRotator::ZeroRotator, [](ARammsProcPiece& P) { P.SizeX = 200.0; P.SizeY = 120.0; P.SizeZ = 1.6; });
-	if (FPiece* Tree = Add(TEXT("Tree"), ERammsProcPieceKind::Tree, FRotator::ZeroRotator, [](ARammsProcPiece& P) { P.SizeX = 300.0; P.SizeZ = 600.0; }))
-	{
-		Tree->Tolerance = 3.0; // canopy blobs are hulls of sphere-boxes
-		Tree->MissFraction = 0.1;
-	}
+	// Canopy blobs are folded outward when built, so each blob's mesh is its hull: exact like the rest.
+	Add(TEXT("Tree"), ERammsProcPieceKind::Tree, FRotator::ZeroRotator, [](ARammsProcPiece& P) { P.SizeX = 300.0; P.SizeZ = 600.0; });
 
 	// No generator: the contributor exports every piece in the level.
 	ARammsMjWorldGenContributor* Contributor = Scene.Spawn<ARammsMjWorldGenContributor>(FTransform::Identity);
@@ -189,15 +200,18 @@ bool FRammsMjWorldGenExportTest::RunTest(const FString& Parameters)
 	{
 		UDynamicMeshComponent* Component = Piece.Actor->MeshComponent;
 		const FBox			   Region = MeshBounds(*Piece.Actor);
+		const FBox			   Local = LocalMeshBounds(*Piece.Actor);
+		const FTransform	   PieceXf = Component->GetComponentTransform();
 		constexpr int32		   Probes = 250;
 		int32				   Misses = 0, Compared = 0;
 		double				   Worst = 0.0;
 		FVector				   WorstAt = FVector::ZeroVector;
 		for (int32 p = 0; p < Probes; ++p)
 		{
-			const double  X = FMath::Lerp(Region.Min.X, Region.Max.X, Rs.FRand());
-			const double  Y = FMath::Lerp(Region.Min.Y, Region.Max.Y, Rs.FRand());
-			const FVector From(X, Y, Region.Max.Z + 50.0), To(X, Y, Region.Min.Z - 50.0);
+			// A plan point drawn in the piece's own frame, probed straight down in the world's.
+			const FVector At = PieceXf.TransformPosition(
+				FVector(FMath::Lerp(Local.Min.X, Local.Max.X, Rs.FRand()), FMath::Lerp(Local.Min.Y, Local.Max.Y, Rs.FRand()), Local.Max.Z));
+			const FVector From(At.X, At.Y, Region.Max.Z + 50.0), To(At.X, At.Y, Region.Min.Z - 50.0);
 
 			FHitResult			  Hit;
 			FCollisionQueryParams Params(SCENE_QUERY_STAT(RammsMjExportProbe), /*bTraceComplex=*/true);

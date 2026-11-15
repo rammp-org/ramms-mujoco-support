@@ -209,16 +209,17 @@ void URammsPhysicsEngineSubsystem::OnWorldBeginPlay(UWorld& World)
 		}
 		++Articulations;
 	}
-	bool bSpawned = false;
+	// The world's contributors before the manager, so they are in the level whenever the manager's first compile
+	// gathers its contributors; and before the ground, since an exported world is the ground.
+	const int32 Exported = AddWorldGenContributors(World);
+	bool		bSpawned = false;
 	if (!TActorIterator<AAMjManager>(&World))
 	{
 		FActorSpawnParameters SP;
 		SP.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 		bSpawned = World.SpawnActor<AAMjManager>(AAMjManager::StaticClass(), FTransform::Identity, SP) != nullptr;
 	}
-	// Before the ground: a generated world that is exported is the ground.
-	const int32 Exported = AddWorldGenContributors(World);
-	const bool	bGroundAdded = bGround && SpawnMuJoCoGround(World);
+	const bool bGroundAdded = bGround && SpawnMuJoCoGround(World);
 	if (bStartRunning)
 	{
 		World.GetTimerManager().SetTimer(StartTimer, FTimerDelegate::CreateUObject(this, &URammsPhysicsEngineSubsystem::TryStartMuJoCo), 0.25f, true);
