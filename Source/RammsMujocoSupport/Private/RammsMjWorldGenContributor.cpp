@@ -12,6 +12,7 @@
 #include "HAL/PlatformTime.h"
 #include "Hash/xxhash.h"
 #include "MuJoCo/Core/AMjManager.h"
+#include "MuJoCo/Convert/MjQuickConvertComponent.h"
 #include "MuJoCo/Core/MjPhysicsEngine.h"
 #include "MuJoCo/Gen/Elements/Assets/MjAsset.gen.h"
 #include "MuJoCo/Gen/Elements/Assets/MjHfield.gen.h"
@@ -30,6 +31,7 @@
 #include "RammsProcPiece.h"
 #include "RammsWorldGenerator.h"
 #include "TimerManager.h"
+#include "UObject/UObjectIterator.h"
 
 #if URLAB_MJ_GEN
 	#include "MuJoCo/Spec/MjEffective.h"
@@ -93,6 +95,9 @@ namespace
 
 	/** Smallest half size a box keeps (cm): MuJoCo rejects a size of zero. */
 	constexpr double MinHalfCm = 0.025;
+
+	/** The surface of a shape whose surface nothing names (RammsCollisionShapes): its friction is DefaultFriction. */
+	const FName DefaultSurfaceName(TEXT("Default"));
 
 	/**
 	 * Whether Points span a volume (they do unless all lie within 0.01 mm of one plane). MuJoCo cannot hull a flat set
@@ -406,10 +411,11 @@ ARammsMjWorldGenContributor::ARammsMjWorldGenContributor()
 	DebugLines = CreateDefaultSubobject<ULineBatchComponent>(TEXT("WorldShapeLines"));
 	DebugLines->bCalculateAccurateBounds = false;
 
-	// Typical sliding friction of dry surfaces against rubber; see SurfaceFriction for how MuJoCo combines it.
-	SurfaceFriction.Add(FName(TEXT("Asphalt")), 0.9f);
-	SurfaceFriction.Add(FName(TEXT("Concrete")), 0.9f);
-	SurfaceFriction.Add(FName(TEXT("Curb")), 0.9f);
+	// Sliding friction against rubber; see SurfaceFriction for how MuJoCo combines it. Hard surfaces keep the flat
+	// ground's 1.0 (as does Default, through DefaultFriction), so a robot tuned on that ground sees the same traction.
+	SurfaceFriction.Add(FName(TEXT("Asphalt")), 1.0f);
+	SurfaceFriction.Add(FName(TEXT("Concrete")), 1.0f);
+	SurfaceFriction.Add(FName(TEXT("Curb")), 1.0f);
 	SurfaceFriction.Add(FName(TEXT("Brick")), 0.8f);
 	SurfaceFriction.Add(FName(TEXT("Cobble")), 0.7f);
 	SurfaceFriction.Add(FName(TEXT("Grass")), 0.6f);
@@ -421,7 +427,6 @@ ARammsMjWorldGenContributor::ARammsMjWorldGenContributor()
 	SurfaceFriction.Add(FName(TEXT("Wood")), 0.6f);
 	SurfaceFriction.Add(FName(TEXT("Glass")), 0.4f);
 	SurfaceFriction.Add(FName(TEXT("Foliage")), 0.5f);
-	SurfaceFriction.Add(FName(TEXT("Default")), 0.9f);
 }
 
 FVector ARammsMjWorldGenContributor::ResolveCentre() const
@@ -441,14 +446,18 @@ double ARammsMjWorldGenContributor::ResolveRadius() const
 
 float ARammsMjWorldGenContributor::FrictionFor(FName Surface) const
 {
-	if (const float* F = SurfaceFriction.Find(Surface))
+	// Default (no known surface) is DefaultFriction, whatever the table says.
+	if (!Surface.IsNone() && Surface != DefaultSurfaceName)
 	{
-		return *F;
+		if (const float* F = SurfaceFriction.Find(Surface))
+		{
+			return *F;
+		}
 	}
 	return DefaultFriction;
 }
 
-void ARammsMjWorldGenContributor::GatherShapes(TArray<FRammsCollisionShape>& Out) const
+FRammsCollisionShapeFilter ARammsMjWorldGenContributor::MakeFilter() const
 {
 	FRammsCollisionShapeFilter Filter;
 	const double			   Radius = ResolveRadius();
@@ -457,37 +466,78 @@ void ARammsMjWorldGenContributor::GatherShapes(TArray<FRammsCollisionShape>& Out
 		Filter.Radius = Radius;
 		Filter.Centre = ResolveCentre();
 	}
+	// MuJoCo already has an actor a quick-convert component converts: exported again, every contact with it would be
+	// doubled.
+	if (const UWorld* World = GetWorld())
+	{
+		for (TObjectIterator<UMjQuickConvertComponent> It; It; ++It)
+		{
+			if (It->GetWorld() == World && It->GetOwner())
+			{
+				Filter.ExcludedActors.Add(It->GetOwner());
+			}
+		}
+	}
+	return Filter;
+}
+
+namespace
+{
+	/** The shapes of every procedural piece in World that Filter keeps (a contributor with no generator). With
+	 *  bStopAtFirst it stops at the first piece with one. Returns whether any were added. */
+	bool GatherAllPieces(UWorld& World, const FRammsCollisionShapeFilter& Filter, TArray<FRammsCollisionShape>& Out, bool bStopAtFirst)
+	{
+		const int32					 First = Out.Num();
+		TArray<FRammsCollisionShape> PieceShapes;
+		for (TActorIterator<ARammsProcPiece> It(&World); It; ++It)
+		{
+			if (Filter.ExcludedActors.Contains(*It))
+			{
+				continue;
+			}
+			PieceShapes.Reset();
+			It->AppendCollisionShapes(PieceShapes);
+			for (FRammsCollisionShape& S : PieceShapes)
+			{
+				if (Filter.Accepts(RammsCollisionShapes::GetBounds(S)))
+				{
+					Out.Add(MoveTemp(S));
+				}
+			}
+			if (bStopAtFirst && Out.Num() > First)
+			{
+				return true;
+			}
+		}
+		return Out.Num() > First;
+	}
+} // namespace
+
+void ARammsMjWorldGenContributor::GatherShapes(TArray<FRammsCollisionShape>& Out) const
+{
+	const FRammsCollisionShapeFilter Filter = MakeFilter();
 	if (Generator)
 	{
 		Generator->GatherCollisionShapes(Out, Filter);
 		return;
 	}
 	// No generator: every procedural piece in the level (hand-placed pieces, tests).
-	UWorld* World = GetWorld();
-	if (!World)
+	if (UWorld* World = GetWorld())
 	{
-		return;
-	}
-	TArray<FRammsCollisionShape> PieceShapes;
-	for (TActorIterator<ARammsProcPiece> It(World); It; ++It)
-	{
-		PieceShapes.Reset();
-		It->AppendCollisionShapes(PieceShapes);
-		for (FRammsCollisionShape& S : PieceShapes)
-		{
-			if (Filter.Accepts(RammsCollisionShapes::GetBounds(S)))
-			{
-				Out.Add(MoveTemp(S));
-			}
-		}
+		GatherAllPieces(*World, Filter, Out, /*bStopAtFirst=*/false);
 	}
 }
 
 bool ARammsMjWorldGenContributor::SuppliesGround() const
 {
-	TArray<FRammsCollisionShape> Shapes;
-	GatherShapes(Shapes);
-	return Shapes.Num() > 0;
+	const FRammsCollisionShapeFilter Filter = MakeFilter();
+	if (Generator)
+	{
+		return Generator->HasCollisionShapes(Filter);
+	}
+	TArray<FRammsCollisionShape> Any;
+	UWorld*						 World = GetWorld();
+	return World && GatherAllPieces(*World, Filter, Any, /*bStopAtFirst=*/true);
 }
 
 FSpecRef ARammsMjWorldGenContributor::GetSceneSpec() const
@@ -661,6 +711,12 @@ void ARammsMjWorldGenContributor::RequestRecompile()
 void ARammsMjWorldGenContributor::RecompileNow()
 {
 	bRecompileQueued = false;
+	if (bAuthored && !bDirty)
+	{
+		// A compile since the request (the manager's first, another contributor's) already exported this world.
+		UE_LOG(LogRammsMjWorldGen, Log, TEXT("%s: the scene already compiled with this world since the request; no recompile"), *GetName());
+		return;
+	}
 	AAMjManager* Manager = AAMjManager::GetManager();
 	if (!Manager || Manager->GetWorld() != GetWorld())
 	{

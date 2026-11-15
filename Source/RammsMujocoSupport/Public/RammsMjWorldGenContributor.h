@@ -13,6 +13,7 @@ class ULineBatchComponent;
 class UMjModel;
 class UMjNodeComponent;
 struct FRammsCollisionShape;
+struct FRammsCollisionShapeFilter;
 
 /**
  * A generated world in MuJoCo, exactly: every collision shape the world reports (ARammsWorldGenerator::
@@ -27,11 +28,14 @@ struct FRammsCollisionShape;
  * Contacts: each geom gets its surface's sliding friction (SurfaceFriction), priority 0 and MuJoCo's default solref and
  * solimp, so robot geoms keep their own contact tuning: a higher-priority robot geom (omni rollers) uses its own
  * parameters outright, and an equal-priority one takes the larger friction of the pair and the mean of the solver
- * parameters, exactly as it did against the flat ground this replaces.
+ * parameters, as it did against the flat ground this replaces. Hard surfaces (asphalt, concrete, curb) and Default
+ * are 1.0, the flat ground's sliding friction, so a robot geom at 0.9 (RAMMP Gen2's collision class) still sees 1.0.
+ *
+ * Actors MuJoCo already has through a UMjQuickConvertComponent are not exported again.
  *
  * URammsPhysicsEngineSubsystem places one per world generator in a MuJoCo level (ramms.mj.WorldShapes). The spec is
  * re-authored only when the world changed (a regeneration, RequestRecompile, a new export region); a recompile for any
- * other reason reuses it.
+ * other reason reuses it, and a queued recompile that another compile already served is dropped.
  */
 UCLASS(ClassGroup = (Ramms), hidecategories = (Input, Collision, Replication, Rendering, HLOD, Cooking, DataLayers, WorldPartition))
 class RAMMSMUJOCOSUPPORT_API ARammsMjWorldGenContributor : public AActor, public IMjSceneContributor
@@ -60,13 +64,15 @@ public:
 
 	/** Sliding friction per surface (RammsCollisionShapes surfaces: Asphalt, Concrete, Curb, Brick, Cobble, Grass ...).
 	 *  Against a robot geom of the same priority MuJoCo uses the larger of the two, so a value under the robot's own
-	 *  friction changes nothing; torsional and rolling friction stay at MuJoCo's defaults. */
+	 *  friction changes nothing; torsional and rolling friction stay at MuJoCo's defaults. Default is not looked up
+	 *  here: it is DefaultFriction. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MuJoCo|Contact")
 	TMap<FName, float> SurfaceFriction;
 
-	/** Sliding friction of a surface the table does not list. */
+	/** Sliding friction of the Default surface (what a shape with no known surface is: most static meshes) and of any
+	 *  surface the table does not list. 1.0, the flat ground's. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MuJoCo|Contact", meta = (ClampMin = "0"))
-	float DefaultFriction = 0.9f;
+	float DefaultFriction = 1.0f;
 
 	/** Recompile the scene when the generator regenerates (OnWorldGenerated). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MuJoCo|World")
@@ -82,11 +88,13 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "MuJoCo|World")
 	int32 NumHeightfields = 0;
 
-	/** The shapes this would export now (the generator's, within the export region). */
+	/** The shapes this would export now (the generator's, within the export region, without the actors MuJoCo already
+	 *  converts through a UMjQuickConvertComponent). */
 	void GatherShapes(TArray<FRammsCollisionShape>& Out) const;
 
-	/** Whether the world has anything to stand on: some shape to export. */
-	UFUNCTION(BlueprintCallable, Category = "MuJoCo|World")
+	/** Whether the world has anything to stand on: some shape to export. Cheap: it stops at the first piece or mesh
+	 *  with a shape. Not pure, so a Blueprint calls it once. */
+	UFUNCTION(BlueprintCallable, BlueprintPure = false, Category = "MuJoCo|World")
 	bool SuppliesGround() const;
 
 	/** Re-author the world geometry and recompile the scene on the next tick (a mid-play compile keeps the robots'
@@ -114,8 +122,10 @@ private:
 	void	RecompileNow();
 	FVector ResolveCentre() const;
 	double	ResolveRadius() const;
-	float	FrictionFor(FName Surface) const;
-	void	RedrawShapes(int32 Mode, const FVector& ViewCentre, double RadiusCm);
+	/** The export region and the actors to leave out (those with a UMjQuickConvertComponent). */
+	FRammsCollisionShapeFilter MakeFilter() const;
+	float					   FrictionFor(FName Surface) const;
+	void					   RedrawShapes(int32 Mode, const FVector& ViewCentre, double RadiusCm);
 
 	/** The spec's root; also this actor's root, so the spec is found without walking its components. */
 	UPROPERTY(VisibleAnywhere, Category = "MuJoCo|World")
