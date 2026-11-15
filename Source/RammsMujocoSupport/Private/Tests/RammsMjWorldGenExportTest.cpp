@@ -505,7 +505,8 @@ bool FRammsMjWorldGenNoDoubleExportTest::RunTest(const FString& Parameters)
 
 namespace RammsMjWorldGenExportTest
 {
-	/** Contact normals of a probe geom resting Depth (m) into two boxes, swept across the seam between them. */
+	/** Contact normals of a probe geom resting Depth (m) into exported boxes, swept across where two of them meet (or
+	 *  met, before they were merged). */
 	struct FSeamSweep
 	{
 		int32  Positions = 0;
@@ -515,13 +516,29 @@ namespace RammsMjWorldGenExportTest
 	};
 
 	/**
-	 * A scene of its own: the two compiled boxes copied as they are, and a free body carrying the probe geom (Type, Size,
-	 * Quat: MuJoCo's frame), its lowest point Lowest (m) under its centre. The probe moves along x from 5 cm before the
-	 * seam to 5 cm past it in 1 mm steps, Depth into the boxes' top; each contact's normal is read after mj_forward.
+	 * A scene of its own: the compiled boxes (unrotated, as an unrotated piece's are) copied as they are, and a free body
+	 * carrying the probe geom (Type, Size, Quat: MuJoCo's frame), its lowest point Lowest (m) under its centre. The probe
+	 * moves along x from 5 cm before SeamX (MuJoCo's x, m) to 5 cm past it in 1 mm steps, Depth into the top of the box
+	 * it comes from; each contact's normal is read after mj_forward.
 	 */
-	bool SweepSeam(const mjModel& Model, int32 BoxA, int32 BoxB, mjtGeom Type, const double Size[3], const double Quat[4], double Lowest, double Depth,
-		FSeamSweep& Out, FString& Error)
+	bool SweepSeam(const mjModel& Model, const TArray<int32>& BoxIds, double SeamX, mjtGeom Type, const double Size[3], const double Quat[4], double Lowest,
+		double Depth, FSeamSweep& Out, FString& Error)
 	{
+		// The box under a point just before the seam sets the sweep's height and line.
+		int32 Approach = INDEX_NONE;
+		for (const int32 Id : BoxIds)
+		{
+			const double X = Model.geom_pos[3 * Id], HalfX = Model.geom_size[3 * Id];
+			if (SeamX - 0.025 > X - HalfX && SeamX - 0.025 < X + HalfX)
+			{
+				Approach = Id;
+			}
+		}
+		if (Approach == INDEX_NONE)
+		{
+			Error = TEXT("no box before the seam");
+			return false;
+		}
 		mjSpec*	 Spec = mj_makeSpec();
 		mjsBody* World = Spec ? mjs_findBody(Spec, "world") : nullptr;
 		if (!World)
@@ -533,7 +550,7 @@ namespace RammsMjWorldGenExportTest
 			}
 			return false;
 		}
-		for (const int32 Id : { BoxA, BoxB })
+		for (const int32 Id : BoxIds)
 		{
 			mjsGeom* Box = mjs_addGeom(World, nullptr);
 			Box->type = mjGEOM_BOX;
@@ -566,12 +583,9 @@ namespace RammsMjWorldGenExportTest
 			mj_deleteSpec(Spec);
 			return false;
 		}
-		mjData* D = mj_makeData(M);
-		// Box A is the one at lower x; the seam is its +x face.
-		const int32	 A = Model.geom_pos[3 * BoxA] < Model.geom_pos[3 * BoxB] ? BoxA : BoxB;
-		const double SeamX = Model.geom_pos[3 * A] + Model.geom_size[3 * A];
-		const double TopZ = Model.geom_pos[3 * A + 2] + Model.geom_size[3 * A + 2];
-		const double Y = Model.geom_pos[3 * A + 1];
+		mjData*		 D = mj_makeData(M);
+		const double TopZ = Model.geom_pos[3 * Approach + 2] + Model.geom_size[3 * Approach + 2];
+		const double Y = Model.geom_pos[3 * Approach + 1];
 		const int32	 Q = M->jnt_qposadr[0];
 		for (int32 s = -50; s <= 50; ++s)
 		{
@@ -609,10 +623,12 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRammsMjWorldGenSeamTest, "Ramms.MuJoCo.WorldGe
 
 bool FRammsMjWorldGenSeamTest::RunTest(const FString& Parameters)
 {
-	// Coplanar neighbours (pavers, panels, the boxes around a pothole) are separate geoms with a seam between them. A
-	// level surface pushes straight up; at a seam MuJoCo can also report a contact on the far geom's edge, whose normal
-	// leans sideways. This measures how far, for a sphere, a wheel-like cylinder and a box like RAMMP Gen1's roller
-	// pads, each 2 mm into the surface (about what a loaded soft contact sinks): it reports, it does not judge.
+	// Coplanar neighbours (pavers, panels, the boxes around a pothole) exported as separate geoms meet at a seam: a body
+	// crossing it gets a contact on the far geom's edge whose normal leans sideways (0.28 of a sphere's, 0.19 of a
+	// wheel's, all of a roller pad's before flush parts were merged). Flush neighbours are now one geom, so crossing
+	// where the seam was must push straight up; a real lip (6 mm) must still be a step. Probes: a sphere, a wheel-like
+	// cylinder and a box like RAMMP Gen1's roller pads, each 2 mm into the surface (about what a loaded soft contact
+	// sinks).
 	using namespace RammsMjWorldGenExportTest;
 	FExportScene Scene;
 	if (!TestTrue(TEXT("world opens"), Scene.Open()))
@@ -620,16 +636,23 @@ bool FRammsMjWorldGenSeamTest::RunTest(const FString& Parameters)
 		AddError(Scene.LastError);
 		return false;
 	}
-	ARammsProcPiece* Pavers = Scene.Spawn<ARammsProcPiece>(FTransform::Identity);
-	if (!TestNotNull(TEXT("pavers spawn"), Pavers))
+	auto SpawnPavers = [&](const FVector& At, double SecondTop) -> ARammsProcPiece* {
+		ARammsProcPiece* P = Scene.Spawn<ARammsProcPiece>(FTransform(At));
+		if (P)
+		{
+			P->Kind = ERammsProcPieceKind::GroundPrisms;
+			P->KindId = -1;
+			P->SizeZ = 10.0;
+			P->Parts = PrismParts({ { TEXT("Concrete"), PrismRect(0.0, 0.0, 100.0, 100.0, 0.0) }, { TEXT("Concrete"), PrismRect(100.0, 0.0, 200.0, 100.0, SecondTop) } });
+			P->Rebuild();
+		}
+		return P;
+	};
+	// Flush at the origin; the second 6 mm proud 10 m along Unreal's Y (MuJoCo's -y).
+	if (!TestNotNull(TEXT("flush pavers spawn"), SpawnPavers(FVector::ZeroVector, 0.0)) || !TestNotNull(TEXT("lipped pavers spawn"), SpawnPavers(FVector(0.0, 1000.0, 0.0), 0.6)))
 	{
 		return false;
 	}
-	Pavers->Kind = ERammsProcPieceKind::GroundPrisms;
-	Pavers->KindId = -1;
-	Pavers->SizeZ = 10.0;
-	Pavers->Parts = PrismParts({ { TEXT("Concrete"), PrismRect(0.0, 0.0, 100.0, 100.0, 0.0) }, { TEXT("Concrete"), PrismRect(100.0, 0.0, 200.0, 100.0, 0.0) } });
-	Pavers->Rebuild();
 	ARammsMjWorldGenContributor* Contributor = Scene.Spawn<ARammsMjWorldGenContributor>(FTransform::Identity);
 	if (!TestNotNull(TEXT("contributor spawns"), Contributor)
 		|| !TestTrue(TEXT("the scene compiles"), Scene.Manager->PhysicsEngine->InstallCompiledSpec(Scene.LastError)))
@@ -638,18 +661,21 @@ bool FRammsMjWorldGenSeamTest::RunTest(const FString& Parameters)
 		return false;
 	}
 	const mjModel* Model = Scene.Manager->PhysicsEngine->GetModel();
-	TArray<int32>  Boxes;
+	TArray<int32>  Flush, Lipped;
 	for (const int32 Id : Contributor->GetBoundGeomIds())
 	{
 		if (Model && Model->geom_type[Id] == mjGEOM_BOX)
 		{
-			Boxes.Add(Id);
+			(Model->geom_pos[3 * Id + 1] > -5.0 ? Flush : Lipped).Add(Id);
 		}
 	}
-	if (!TestEqual(TEXT("two paver boxes"), Boxes.Num(), 2))
+	const bool bFlushOne = TestEqual(TEXT("flush pavers are one box"), Flush.Num(), 1);
+	const bool bLippedTwo = TestEqual(TEXT("lipped pavers stay two boxes"), Lipped.Num(), 2);
+	if (!Model || !bFlushOne || !bLippedTwo)
 	{
 		return false;
 	}
+	const double SeamX = 1.0; // Unreal's x = 100 cm, where the two pavers meet
 
 	struct FProbe
 	{
@@ -658,25 +684,31 @@ bool FRammsMjWorldGenSeamTest::RunTest(const FString& Parameters)
 		double		 Size[3];
 		double		 Quat[4];
 		double		 Lowest;
+		/** At the 6 mm lip the normal must lean at least this far (the step's edge or face). */
+		double LipShare;
 	};
 	const double H = 0.70710678118654752; // the cylinder's axis turned from z onto y
 	const FProbe Probes[] = {
-		{ TEXT("sphere r 5 cm"), mjGEOM_SPHERE, { 0.05, 0.0, 0.0 }, { 1.0, 0.0, 0.0, 0.0 }, 0.05 },
-		{ TEXT("wheel (cylinder r 10 cm, 6 cm wide)"), mjGEOM_CYLINDER, { 0.10, 0.03, 0.0 }, { H, H, 0.0, 0.0 }, 0.10 },
-		{ TEXT("roller pad (box 2.2 x 0.8 x 1.9 cm)"), mjGEOM_BOX, { 0.011, 0.004, 0.009375 }, { 1.0, 0.0, 0.0, 0.0 }, 0.009375 },
+		{ TEXT("sphere r 5 cm"), mjGEOM_SPHERE, { 0.05, 0.0, 0.0 }, { 1.0, 0.0, 0.0, 0.0 }, 0.05, 0.4 },
+		{ TEXT("wheel (cylinder r 10 cm, 6 cm wide)"), mjGEOM_CYLINDER, { 0.10, 0.03, 0.0 }, { H, H, 0.0, 0.0 }, 0.10, 0.25 },
+		{ TEXT("roller pad (box 2.2 x 0.8 x 1.9 cm)"), mjGEOM_BOX, { 0.011, 0.004, 0.009375 }, { 1.0, 0.0, 0.0, 0.0 }, 0.009375, 0.9 },
 	};
 	for (const FProbe& P : Probes)
 	{
-		FSeamSweep Sweep;
+		FSeamSweep Across, Lip;
 		FString	   Error;
-		if (!TestTrue(FString::Printf(TEXT("%s: the probe scene compiles"), P.Name), SweepSeam(*Model, Boxes[0], Boxes[1], P.Type, P.Size, P.Quat, P.Lowest, 0.002, Sweep, Error)))
+		if (!TestTrue(FString::Printf(TEXT("%s: the probe scenes compile"), P.Name),
+				SweepSeam(*Model, Flush, SeamX, P.Type, P.Size, P.Quat, P.Lowest, 0.002, Across, Error)
+					&& SweepSeam(*Model, Lipped, SeamX, P.Type, P.Size, P.Quat, P.Lowest, 0.002, Lip, Error)))
 		{
 			AddError(Error);
 			continue;
 		}
-		TestEqual(FString::Printf(TEXT("%s: every position is in contact"), P.Name), Sweep.WithoutContact, 0);
-		AddInfo(FString::Printf(TEXT("%s, 2 mm in, across the seam: largest sideways share of a contact normal %.3f, %+.0f mm from the seam (%d positions)"),
-			P.Name, Sweep.WorstHorizontal, Sweep.WorstAtMm, Sweep.Positions));
+		TestEqual(FString::Printf(TEXT("%s: every position is in contact"), P.Name), Across.WithoutContact + Lip.WithoutContact, 0);
+		AddInfo(FString::Printf(TEXT("%s, 2 mm in: largest sideways share of a contact normal %.3f where flush pavers met (%+.0f mm), %.3f at a 6 mm lip (%+.0f mm)"),
+			P.Name, Across.WorstHorizontal, Across.WorstAtMm, Lip.WorstHorizontal, Lip.WorstAtMm));
+		TestTrue(FString::Printf(TEXT("%s: no sideways push where flush pavers met (%.3f)"), P.Name, Across.WorstHorizontal), Across.WorstHorizontal < 0.01);
+		TestTrue(FString::Printf(TEXT("%s: the lip is still a step (%.3f, at least %.2f)"), P.Name, Lip.WorstHorizontal, P.LipShare), Lip.WorstHorizontal >= P.LipShare);
 	}
 	return true;
 }
