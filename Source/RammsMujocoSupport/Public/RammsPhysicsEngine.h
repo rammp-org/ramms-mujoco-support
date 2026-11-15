@@ -45,11 +45,17 @@ public:
 	bool bStartMuJoCoRunning = true;
 
 	/** On MuJoCo, when the level gives MuJoCo no static geometry of its own (no UMjQuickConvertComponent
-	 *  marked Static, no heightfield), add a flat ground at the floor under the articulations so a mobile
-	 *  robot stands. Walls, curbs and furniture are not converted; a fixed object (a SimReady fridge) needs
-	 *  none of it. */
+	 *  marked Static, no heightfield, no exported generated world), add a flat ground at the floor under the
+	 *  articulations so a mobile robot stands. Walls, curbs and furniture are not converted; a fixed object (a
+	 *  SimReady fridge) needs none of it. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ramms|Physics")
 	bool bMuJoCoGround = true;
+
+	/** On MuJoCo, export each generated world (ARammsWorldGenerator) exactly, as MuJoCo world geoms
+	 *  (ARammsMjWorldGenContributor): curbs, ramps, walls and props as boxes, hulls and height fields. The
+	 *  console's ramms.mj.WorldShapes overrides it. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ramms|Physics")
+	bool bMuJoCoWorldShapes = true;
 };
 
 /**
@@ -69,6 +75,14 @@ public:
 
 	/** The run's override (-RammsPhysics= or ramms.Physics.Engine), else the level's ARammsPhysicsSettings. */
 	static ERammsLevelPhysicsEngine ResolveEngine(const UWorld& World, bool* bOutStartMuJoCoRunning = nullptr, bool* bOutMuJoCoGround = nullptr);
+
+	/**
+	 * One ARammsMjWorldGenContributor per world generator that no contributor in the level exports yet (as
+	 * ramms.mj.WorldShapes and ARammsPhysicsSettings::bMuJoCoWorldShapes allow). A contributor with no Generator
+	 * exports every piece in the level, so with one present none is added. Returns how many were added. Called when a
+	 * level starts on MuJoCo.
+	 */
+	static int32 AddWorldGenContributors(UWorld& World);
 
 	virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
 	virtual void OnWorldBeginPlay(UWorld& World) override;

@@ -29,6 +29,10 @@
 		{
 			"Name": "RammsControl",
 			"Enabled": true
+		},
+		{
+			"Name": "RammsWorldGen",
+			"Enabled": true
 		}
 	]
 }

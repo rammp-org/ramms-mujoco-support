@@ -86,7 +86,7 @@ The same articulation assets run on either engine; the level picks which. Put an
 | Engine | at BeginPlay |
 |---|---|
 | **Auto** (default) | the level as placed: MuJoCo simulates what its `AAMjManager` compiles, Chaos what carries an active `URammsChaosArticulationComponent` (such a level must not also have an `AAMjManager`, or MuJoCo simulates that articulation too). A level with no settings actor behaves the same, so existing levels are unchanged |
-| **MuJoCo** | spawns an `AAMjManager` when the level has none (and starts it unless `bStartMuJoCoRunning` is off), turns off every Chaos articulation component (also in articulations spawned later; one that `SwitchToChaos` adds still builds), and, when the level has no static MuJoCo geometry (`UMjQuickConvertComponent` with Static, or a heightfield) and `bMuJoCoGround` is on, adds a hidden static slab at the floor under the articulations so they have something to stand on |
+| **MuJoCo** | spawns an `AAMjManager` when the level has none (and starts it unless `bStartMuJoCoRunning` is off), turns off every Chaos articulation component (also in articulations spawned later; one that `SwitchToChaos` adds still builds), exports each generated world exactly ([below](#generated-worlds-in-mujoco)), and, when the level has no static MuJoCo geometry (`UMjQuickConvertComponent` with Static, a heightfield, or an exported generated world) and `bMuJoCoGround` is on, adds a hidden static slab at the floor under the articulations so they have something to stand on |
 | **Chaos** | removes every `AAMjManager` before it compiles and switches every articulation to Chaos (`SwitchToChaos`, starting in its `URammsMjSimControlComponent::InitialKeyframe` when it has one), including ones spawned later |
 
 A run overrides the level with `-RammsPhysics=MuJoCo|Chaos|Auto` on the command line or the
@@ -101,3 +101,76 @@ it unless the MJCF `<exclude>`s the pair. RammsWorldGen's `Tools/simready_mjcf.p
 
 Tests and measurements are in ramms-sim's `Scripts/pie_tests/chaos_articulation/` and
 `doc/chaos_physics_backend_plan.md`.
+
+## Generated worlds in MuJoCo
+
+A RammsWorldGen level (an `ARammsWorldGenerator`) reaches MuJoCo exactly: **`ARammsMjWorldGenContributor`**
+(a URLab `IMjSceneContributor`) turns the generator's collision shapes
+(`ARammsWorldGenerator::GatherCollisionShapes`, see RammsWorldGen's README, "Collision shapes") into static
+geoms on MuJoCo's world body, so what MuJoCo collides with is what Chaos collides with. A 15 cm curb face
+stays a vertical 15 cm step; URLab's `AMjHeightfieldActor` would make it a slope one sample wide.
+
+| Shape | MuJoCo |
+|---|---|
+| Box | `box` geom |
+| Convex hull | `mesh` geom over a `<mesh>` of the hull's vertices (no faces: MuJoCo hulls them), shared by content hash, so identical props share one asset |
+| Height grid (curb ramp flares, mounds) | `hfield` geom over an `<hfield>` with the grid's samples, shared by content; MuJoCo splits each cell along the same diagonal the grid does |
+| Sphere, capsule | `sphere`, `capsule` geom |
+| A hull flat to 0.01 mm | the thin `box` it fills (MuJoCo cannot hull a flat set) |
+
+Positions, rotations and mesh vertices go through URLab's own conversion (`FMjPosition3::FromUnreal`,
+`FMjQuatRot::FromUnreal`, `URLabAxisConv::UePositionToMj`: centimetres to metres, Unreal's Y mirrored).
+Geoms are in collision group 3 (MuJoCo's viewers and `URammsMjCompiledGeomRenderer` leave it out); the level
+already shows them. They never collide with each other (MuJoCo skips pairs welded to one body), so the cost is
+the broadphase; the log gives counts and times per compile:
+
+```
+LogRammsMjWorldGen: <contributor>: exported <n> shapes as <n> geoms (<b> boxes, <m> meshes over <a> shared assets, <h> hfield geoms over <f> fields, <r> spheres/capsules, <z> flat hulls as boxes) in <t> ms (gather <g> ms)
+LogRammsMjWorldGen: <contributor>: <n> world geoms in the compiled model; compiled and bound <t> ms after authoring
+```
+
+**Friction** is per surface (`SurfaceFriction`: asphalt, concrete and curb 1.0, brick 0.8, cobble 0.7, foliage
+0.5, grass, dirt, gravel and wood 0.6, metal 0.5, mud 0.4, glass 0.4, water 0.3). The `Default` surface (a
+shape no label or material names, which is most static meshes) and any surface the table does not list take
+`DefaultFriction`, 1.0. All with priority 0 and MuJoCo's default solver parameters. Robot geoms keep their
+tuning: a higher-priority one (the omni rollers) uses its own parameters outright, and an equal-priority one
+takes the larger sliding friction of the pair, so a surface under the robot's own friction changes nothing.
+Hard surfaces and `Default` are 1.0 because the flat slab this replaces was: a robot geom at 0.9 (RAMMP Gen2's
+`collision` class, its drive links included) gets 1.0 there, as it did on the slab. A softer surface lowers a
+contact only as far as the robot geom's own friction: RAMMP Gen1's geoms (1.0) and the omni rollers (priority 1)
+see no change anywhere, and Gen2's 0.9 geoms see 0.9 on grass, cobble or brick instead of the slab's 1.0.
+
+**When it is added.** `URammsPhysicsEngineSubsystem` places one per generator when the level runs on MuJoCo
+(Engine MuJoCo, or Auto with an `AAMjManager` in the level, which the log says, since it changes what such a
+level's manager compiles), unless `ARammsPhysicsSettings::bMuJoCoWorldShapes` is off or the level samples its
+terrain with an `AMjHeightfieldActor` (the two together would round the curb faces again; remove the
+heightfield). `ramms.mj.WorldShapes` overrides: 0 never, 1 as described, 2 always. An exported world is the
+ground, so the flat slab is not added (`SuppliesGround` checks cheaply: the first piece or mesh with a shape
+answers it). A placed contributor is kept as it is, and its generator gets no second one; a contributor with no
+`Generator` exports every procedural piece in the level, so then no generator gets one. An actor MuJoCo already
+has through a `UMjQuickConvertComponent` is never exported again.
+
+**Regeneration.** The contributor binds the generator's `OnWorldGenerated` and recompiles the scene on the
+next tick (`AAMjManager::CompileModel`: robots keep their state, a failed compile keeps the old model). A
+recompile for any other reason reuses the authored spec, and a queued recompile that another compile already
+served (the manager's first, another contributor's) is dropped. `ramms.mj.RecompileWorldShapes` re-exports and
+recompiles by hand (after moving pieces in PIE, or changing the radius).
+
+**Region.** `ExportRadius` (or `ramms.mj.WorldShapesRadius`, metres) keeps only what lies within that
+distance in plan of the generator's suggested start: worth it for a large downtown.
+
+**Overlay.** `ramms.mj.DrawWorldShapes 1` draws the geoms as MuJoCo compiled them (from `mjModel`, through
+URLab's conversion back to Unreal) over the level: boxes green, meshes cyan, height fields yellow with
+MuJoCo's cell diagonals, spheres and capsules magenta; `2` draws them over everything,
+`ramms.mj.DrawWorldShapesRadius` (default 40 m around the view, 0 for all) limits them.
+
+`Ramms.MuJoCo.WorldGenExport.MatchesChaos` compiles every piece kind, ground prisms and humps included
+(and pitched, rolled and scaled pieces), and compares MuJoCo's own ray (`mj_ray`) with Chaos's trace of each
+piece: within 2 mm. `Ramms.MuJoCo.WorldGenExport.NoDoubleExport` checks that no generator gets two
+contributors (nor any, beside one with no `Generator`) and that quick-converted actors are left out.
+`Ramms.MuJoCo.WorldGenExport.SeamContacts` sweeps a sphere, a wheel-like cylinder and a roller pad, 2 mm in,
+across where two pavers meet. Separate geoms meeting at a seam give the far one's edge a contact whose normal
+leans sideways (measured before the fix: 0.28 of the sphere's, 0.19 of the wheel's, all of the roller pad's), so
+flush neighbours are exported as one geom (RammsWorldGen merges flush GroundPrisms parts and flush boxes): across
+flush pavers the test requires no lean over 0.01, and at a 6 mm lip it requires the step to remain (sphere at
+least 0.4, wheel 0.25, roller pad 0.9).
