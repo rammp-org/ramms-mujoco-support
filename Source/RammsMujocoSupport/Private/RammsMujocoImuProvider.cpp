@@ -3,18 +3,27 @@
 #include "RammsMujocoImuProvider.h"
 
 #include "Components/SceneComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
+#include "HAL/IConsoleManager.h"
 #include "MuJoCo/Core/AMjManager.h"
 #include "MuJoCo/Core/MjPhysicsEngine.h"
 #include "MuJoCo/Elements/MjBody.h"
 #include "MuJoCo/Utils/URLabAxisConv.h"
+#include "PhysicsEngine/BodySetup.h"
 #include "RammsChaosArticulationComponent.h"
 #include "RammsImuMath.h"
 #include "mujoco/mujoco.h"
 
 static_assert(sizeof(mjtNum) == sizeof(double), "the IMU provider copies qvel as doubles");
+
+static TAutoConsoleVariable<int32> CVarRammsImuMuJoCoAcceleration(TEXT("ramms.Imu.MuJoCoAcceleration"), 0,
+	TEXT("The acceleration MuJoCo IMU samples report. 0 (default): realized, what the integrator applied over the step, ")
+		TEXT("(qvel after - qvel before) / timestep, like Chaos. 1: explicit, the forward pass's qacc, what MuJoCo's own ")
+			TEXT("accelerometer reads (not what implicit / implicitfast applied under stiff damping)."));
 
 TSharedPtr<IRammsImuProvider> MakeRammsMujocoImuProvider(UWorld& World)
 {
@@ -25,6 +34,7 @@ FRammsMujocoImuProvider::FRammsMujocoImuProvider(UWorld& InWorld)
 	: World(&InWorld)
 	, Table(MakeShared<FTable, ESPMode::ThreadSafe>())
 {
+	Table->Acceleration = AccelerationSetting();
 }
 
 FRammsMujocoImuProvider::~FRammsMujocoImuProvider()
@@ -39,6 +49,11 @@ FRammsMujocoImuProvider::~FRammsMujocoImuProvider()
 // ---------------------------------------------------------------------------
 // Game thread
 // ---------------------------------------------------------------------------
+
+ERammsMjImuAcceleration FRammsMujocoImuProvider::AccelerationSetting()
+{
+	return CVarRammsImuMuJoCoAcceleration.GetValueOnGameThread() == 1 ? ERammsMjImuAcceleration::Explicit : ERammsMjImuAcceleration::Realized;
+}
 
 UMjPhysicsEngine* FRammsMujocoImuProvider::EngineFor(const UMjBody& Body)
 {
@@ -65,6 +80,24 @@ UMjPhysicsEngine* FRammsMujocoImuProvider::EngineFor(const UMjBody& Body)
 FString FRammsMujocoImuProvider::BodyNameOf(const UMjBody& Body)
 {
 	return Body.MjName.IsSet() && !Body.MjName.GetValue().IsEmpty() ? Body.MjName.GetValue() : Body.GetName();
+}
+
+FVector FRammsMujocoImuProvider::QuickConvertPivot(const UMjBody& Body)
+{
+	// UMjBody::RefreshMeshPivotOffset's rule (its result is private): the first child static mesh's collision bounds
+	// centre, in the body's local frame.
+	TArray<USceneComponent*> Children;
+	Body.GetChildrenComponents(/*bIncludeAllDescendants=*/true, Children);
+	for (const USceneComponent* Child : Children)
+	{
+		const UStaticMeshComponent* Mesh = Cast<UStaticMeshComponent>(Child);
+		const UBodySetup*			Setup = Mesh && Mesh->GetStaticMesh() ? Mesh->GetStaticMesh()->GetBodySetup() : nullptr;
+		if (Setup)
+		{
+			return Setup->AggGeom.CalcAABB(FTransform::Identity).GetCenter();
+		}
+	}
+	return FVector::ZeroVector;
 }
 
 bool FRammsMujocoImuProvider::Resolve(USceneComponent& Component, FName Bone, const FTransform& LocalPose, bool /*bExplicit*/,
@@ -108,8 +141,17 @@ bool FRammsMujocoImuProvider::Resolve(USceneComponent& Component, FName Bone, co
 		return true;
 	}
 
-	// Else MuJoCo, when this world has a MuJoCo scene (it may not have compiled yet: the point waits for it).
-	if (!EngineFor(*Body))
+	// Else MuJoCo, when this world has a MuJoCo scene (it may not have compiled yet: the point waits for it). A body
+	// Unreal poses (a mocap body, or one welded to it) MuJoCo reports as still: Kinematic serves it.
+	const UMjPhysicsEngine* Engine = EngineFor(*Body);
+	if (!Engine)
+	{
+		return false;
+	}
+	const mjModel*			Model = Engine->GetModel();
+	const TOptional<int32>& Bound = Body->GetBoundId();
+	const bool				bCompiled = Model && Bound.IsSet() && Bound.GetValue() >= 0 && Bound.GetValue() < Model->nbody;
+	if (bCompiled ? IsMocapDriven(Model, Bound.GetValue()) : Body->GetMocap())
 	{
 		return false;
 	}
@@ -163,6 +205,62 @@ void FRammsMujocoImuProvider::Untrack(int32 Handle)
 	Table->Points.Remove(Handle);
 }
 
+bool FRammsMujocoImuProvider::IsTrackValid(int32 Handle) const
+{
+	// The body is gone, the scene is gone (its manager destroyed), Chaos now simulates the robot, or Unreal poses
+	// the body: another provider serves the point (the subsystem resolves it again).
+	const FTracked* Entry = Tracked.Find(Handle);
+	const UMjBody*	Body = Entry ? Entry->Body.Get() : nullptr;
+	if (!Body)
+	{
+		return false;
+	}
+	const UMjPhysicsEngine* Engine = EngineFor(*Body);
+	if (!Engine)
+	{
+		return false;
+	}
+	const AActor* Owner = Body->GetOwner();
+	if (const URammsChaosArticulationComponent* OnChaos = Owner ? Owner->FindComponentByClass<URammsChaosArticulationComponent>() : nullptr;
+		OnChaos && OnChaos->IsBuilt())
+	{
+		return false;
+	}
+	const mjModel*			Model = Engine->GetModel();
+	const TOptional<int32>& Bound = Body->GetBoundId();
+	return !(Model && Bound.IsSet() && Bound.GetValue() >= 0 && Bound.GetValue() < Model->nbody && IsMocapDriven(Model, Bound.GetValue()));
+}
+
+void FRammsMujocoImuProvider::SetHistoryCapacity(int32 Handle, int32 Capacity)
+{
+	// Sized here, on the game thread; the physics thread only writes into it.
+	FScopeLock Guard(&Table->Lock);
+	if (FPoint* Point = Table->Points.Find(Handle))
+	{
+		Point->History.SetCapacity(Capacity);
+	}
+}
+
+bool FRammsMujocoImuProvider::ReadHistory(int32 Handle, int64 Since, int32 Max, TArray<FRammsImuSample>& OutSamples, int64& OutFirst,
+	int64& OutOldest, int64& OutNext)
+{
+	// A recompile is noticed here as well as on GetSample: a point only read through its history follows it too.
+	if (FTracked* Entry = Tracked.Find(Handle))
+	{
+		Refresh(Handle, *Entry, /*bForce=*/false);
+	}
+	FScopeLock	  Guard(&Table->Lock);
+	const FPoint* Point = Table->Points.Find(Handle);
+	if (!Point || Point->History.GetCapacity() == 0)
+	{
+		return false;
+	}
+	OutFirst = Point->History.Read(Since, Max, OutSamples);
+	OutOldest = Point->History.GetOldestSeq();
+	OutNext = Point->History.GetNextSeq();
+	return true;
+}
+
 void FRammsMujocoImuProvider::Refresh(int32 Handle, FTracked& Entry, bool bForce)
 {
 	// The compile runs on the game thread, so the engine's model pointer and the body's bound id read here are the
@@ -174,7 +272,7 @@ void FRammsMujocoImuProvider::Refresh(int32 Handle, FTracked& Entry, bool bForce
 	if (Body && Model)
 	{
 		const TOptional<int32>& Bound = Body->GetBoundId();
-		if (Bound.IsSet() && Bound.GetValue() >= 0 && Bound.GetValue() < Model->nbody)
+		if (Bound.IsSet() && Bound.GetValue() >= 0 && Bound.GetValue() < Model->nbody && !IsMocapDriven(Model, Bound.GetValue()))
 		{
 			BodyId = Bound.GetValue();
 		}
@@ -183,8 +281,14 @@ void FRammsMujocoImuProvider::Refresh(int32 Handle, FTracked& Entry, bool bForce
 	{
 		Hook(*Engine);
 	}
+	const ERammsMjImuAcceleration Acceleration = AccelerationSetting();
 	if (!bForce && Model == Entry.Model && BodyId == Entry.BodyId && Engine == Entry.Engine.Get())
 	{
+		if (Table->Acceleration != Acceleration)
+		{
+			FScopeLock Guard(&Table->Lock);
+			Table->Acceleration = Acceleration;
+		}
 		return;
 	}
 	Entry.Engine = Engine;
@@ -196,11 +300,11 @@ void FRammsMujocoImuProvider::Refresh(int32 Handle, FTracked& Entry, bool bForce
 	{
 		// UMjBody::ApplyRenderState places a converted body's component at its MuJoCo frame less its mesh pivot
 		// offset: the MuJoCo frame is that far along the component's axes.
-		const FVector Pivot = Body->GetComponentQuat().UnrotateVector(Body->GetWorldPosition() - Body->GetComponentLocation());
-		PointInMjBody.SetLocation(PointInMjBody.GetLocation() - Pivot);
+		PointInMjBody.SetLocation(PointInMjBody.GetLocation() - QuickConvertPivot(*Body));
 	}
 
 	FScopeLock Guard(&Table->Lock);
+	Table->Acceleration = Acceleration;
 	if (FPoint* Point = Table->Points.Find(Handle))
 	{
 		Point->Model = Model;
@@ -287,7 +391,28 @@ FVector FRammsMujocoImuProvider::MjAxialToUe(const double In[3])
 	return FVector(-In[0], In[1], -In[2]);
 }
 
-void FRammsMujocoImuProvider::EnsureAccelerations(const mjModel* M, mjData* D, const double* PreStepQvel)
+bool FRammsMujocoImuProvider::IsMocapDriven(const mjModel* M, int32 BodyId)
+{
+	if (!M || BodyId <= 0 || BodyId >= M->nbody)
+	{
+		return false;
+	}
+	// Up the chain while no dof moves the body relative to its parent: a mocap body met on the way poses it.
+	for (int32 Body = BodyId; Body > 0; Body = M->body_parentid[Body])
+	{
+		if (M->body_mocapid[Body] >= 0)
+		{
+			return true;
+		}
+		if (M->body_dofnum[Body] > 0)
+		{
+			return false;
+		}
+	}
+	return false; // welded to the world: still, and simulated as such
+}
+
+void FRammsMujocoImuProvider::EnsureAccelerations(const mjModel* M, mjData* D, const double* PreStepQvel, double* Scratch)
 {
 	if (!M || !D || D->flg_rnepost)
 	{
@@ -300,16 +425,63 @@ void FRammsMujocoImuProvider::EnsureAccelerations(const mjModel* M, mjData* D, c
 	}
 	// cacc = cacc(parent) + cdof_dot qvel + cdof qacc: cdof_dot and qacc are the forward pass's, so qvel must be the
 	// one it ran with, not the one the integrator wrote after it.
-	const int32							 Count = M->nv;
-	TArray<double, TInlineAllocator<64>> Stepped;
-	Stepped.SetNumUninitialized(Count);
-	FMemory::Memcpy(Stepped.GetData(), D->qvel, sizeof(double) * Count);
+	const int32	   Count = M->nv;
+	TArray<double> Allocated;
+	if (Scratch == nullptr)
+	{
+		Allocated.SetNumUninitialized(Count);
+		Scratch = Allocated.GetData();
+	}
+	FMemory::Memcpy(Scratch, D->qvel, sizeof(double) * Count);
 	FMemory::Memcpy(D->qvel, PreStepQvel, sizeof(double) * Count);
 	mj_rnePostConstraint(M, D);
-	FMemory::Memcpy(D->qvel, Stepped.GetData(), sizeof(double) * Count);
+	FMemory::Memcpy(D->qvel, Scratch, sizeof(double) * Count);
 }
 
-bool FRammsMujocoImuProvider::ComputeSample(const mjModel* M, const mjData* D, int32 BodyId, const FTransform& PointInBody,
+void FRammsMujocoImuProvider::ComputeRealizedAccelerations(const mjModel* M, mjData* D, const double* PreStepQvel, bool bSwapQvel, double* Scratch)
+{
+	if (!M || !D)
+	{
+		return;
+	}
+	const int32	 Count = M->nv;
+	const double Timestep = M->opt.timestep;
+	if (Count <= 0 || PreStepQvel == nullptr || Timestep <= 0.0)
+	{
+		mj_rnePostConstraint(M, D); // nothing moves: cacc is the world's -gravity everywhere
+		D->flg_rnepost = 0;
+		return;
+	}
+	TArray<double> Allocated;
+	if (Scratch == nullptr)
+	{
+		Allocated.SetNumUninitialized(2 * Count);
+		Scratch = Allocated.GetData();
+	}
+	double* KeptQvel = Scratch;
+	double* KeptQacc = Scratch + Count;
+	FMemory::Memcpy(KeptQacc, D->qacc, sizeof(double) * Count);
+	// The acceleration the integrator applied: it advanced qvel by exactly timestep x the qacc it solved for.
+	for (int32 i = 0; i < Count; ++i)
+	{
+		D->qacc[i] = (D->qvel[i] - PreStepQvel[i]) / Timestep;
+	}
+	if (bSwapQvel)
+	{
+		FMemory::Memcpy(KeptQvel, D->qvel, sizeof(double) * Count);
+		FMemory::Memcpy(D->qvel, PreStepQvel, sizeof(double) * Count);
+	}
+	mj_rnePostConstraint(M, D);
+	if (bSwapQvel)
+	{
+		FMemory::Memcpy(D->qvel, KeptQvel, sizeof(double) * Count);
+	}
+	FMemory::Memcpy(D->qacc, KeptQacc, sizeof(double) * Count);
+	// What cacc (and cfrc_int / cfrc_ext) now hold is not MuJoCo's own: anything that needs those computes them again.
+	D->flg_rnepost = 0;
+}
+
+bool FRammsMujocoImuProvider::ComputeSample(const mjModel* M, const mjData* D, int32 BodyId, const FTransform& PointInBody, double StateTime,
 	FRammsImuSample& OutSample)
 {
 	if (!M || !D || BodyId < 0 || BodyId >= M->nbody)
@@ -326,7 +498,7 @@ bool FRammsMujocoImuProvider::ComputeSample(const mjModel* M, const mjData* D, i
 	Sample.bValid = true;
 	Sample.bHasAcceleration = true;
 	Sample.Source = ERammsImuSource::MuJoCo;
-	Sample.SimTimeSeconds = D->time;
+	Sample.SimTimeSeconds = StateTime;
 	Sample.Location = BodyLocation + Lever;
 	Sample.Orientation = BodyRotation * PointInBody.GetRotation();
 	Sample.Gravity = Gravity;
@@ -373,12 +545,32 @@ void FRammsMujocoImuProvider::PreStep(FTable& Table, const mjModel* M, const mjD
 	{
 		return;
 	}
-	FModelState& State = Table.Models.FindOrAdd(M);
-	State.PreStepTime = D->time;
-	State.PreStepQvel.SetNumUninitialized(M->nv);
+	FModelState* State = Table.Models.Find(M);
+	if (!State)
+	{
+		// A model met for the first time (a compile): forget the ones no point is on any more, then size this one's
+		// buffers. The only allocations on this thread, once per model.
+		for (auto It = Table.Models.CreateIterator(); It; ++It)
+		{
+			bool bReferenced = false;
+			for (const TPair<int32, FPoint>& Pair : Table.Points)
+			{
+				bReferenced |= Pair.Value.Model == It.Key();
+			}
+			if (!bReferenced)
+			{
+				It.RemoveCurrent();
+			}
+		}
+		State = &Table.Models.Add(M);
+	}
+	State->PreStepQvel.SetNumUninitialized(M->nv, EAllowShrinking::No);
+	State->Scratch.SetNumUninitialized(2 * M->nv, EAllowShrinking::No);
+	State->PreStepData = D;
+	State->PreStepTime = D->time;
 	if (M->nv > 0)
 	{
-		FMemory::Memcpy(State.PreStepQvel.GetData(), D->qvel, sizeof(double) * M->nv);
+		FMemory::Memcpy(State->PreStepQvel.GetData(), D->qvel, sizeof(double) * M->nv);
 	}
 }
 
@@ -391,6 +583,7 @@ void FRammsMujocoImuProvider::PostStep(FTable& Table, const mjModel* M, mjData* 
 	}
 	bool bAny = false;
 	bool bUnsampled = false;
+	bool bMoved = false; // a body's pose differs from its last sample's (a paused scene edited)
 	for (const TPair<int32, FPoint>& Pair : Table.Points)
 	{
 		const FPoint& Point = Pair.Value;
@@ -398,34 +591,66 @@ void FRammsMujocoImuProvider::PostStep(FTable& Table, const mjModel* M, mjData* 
 		{
 			bAny = true;
 			bUnsampled |= !Point.Latest.bValid;
+			const mjtNum* Pos = D->xpos + 3 * Point.BodyId;
+			const mjtNum* Quat = D->xquat + 4 * Point.BodyId;
+			for (int32 i = 0; i < 3 && !bMoved; ++i)
+			{
+				bMoved |= Pos[i] != Point.SampledPose[i];
+			}
+			for (int32 i = 0; i < 4 && !bMoved; ++i)
+			{
+				bMoved |= Quat[i] != Point.SampledPose[3 + i];
+			}
 		}
 	}
-	if (!bAny)
+	FModelState* State = bAny ? Table.Models.Find(M) : nullptr;
+	if (!State)
+	{
+		return; // no point on M, or no pre-step callback has seen M yet
+	}
+	// The callbacks run on every pass of URLab's loop, paused too: nothing new until the clock moves, a point has no
+	// sample yet, or the paused scene was edited.
+	if (D->time == State->LastSampled && !bUnsampled && !bMoved)
 	{
 		return;
 	}
-	FModelState& State = Table.Models.FindOrAdd(M);
-	// The callbacks run on every pass of URLab's loop, paused too: nothing new until the clock moves (or a point
-	// has no sample yet).
-	if (D->time == State.LastSampled && !bUnsampled)
-	{
-		return;
-	}
-	// Exactly one step since the pre-step callback: the forward pass ran with the qvel kept then. Several (a
-	// client stepping the scene in batches) or none (paused): the current qvel, which is exact when nothing has
-	// been integrated since the forward pass and off by a step's change in velocity otherwise.
+
+	// What this pass did since the pre-step callback: one step (the usual), several (a client stepping in batches),
+	// or none (paused; a reset or a state pushed without a step).
+	const double Timestep = M->opt.timestep;
 	const double TimeSlack = 1.0e-9 * FMath::Max(1.0, FMath::Abs(D->time));
-	const bool	 bOneStep = State.PreStepQvel.Num() == M->nv && D->time > State.PreStepTime
-		&& FMath::IsNearlyEqual(D->time, State.PreStepTime + M->opt.timestep, TimeSlack);
-	EnsureAccelerations(M, D, bOneStep ? State.PreStepQvel.GetData() : nullptr);
-	State.LastSampled = D->time;
+	const bool	 bStepped = State->PreStepData == D && D->time > State->PreStepTime;
+	const bool	 bOneStep = bStepped && State->PreStepQvel.Num() == M->nv && FMath::IsNearlyEqual(D->time, State->PreStepTime + Timestep, TimeSlack);
+	const bool	 bRungeKutta = M->opt.integrator == mjINT_RK4;
+
+	// The time of the state the derived quantities describe: the start of the last step (its forward pass); RK4's
+	// last stage evaluated them at the end; without a step, the current time.
+	double StateTime = D->time;
+	if (bStepped && !bRungeKutta)
+	{
+		StateTime = bOneStep ? State->PreStepTime : D->time - Timestep;
+	}
+
+	if (bOneStep && Table.Acceleration == ERammsMjImuAcceleration::Realized)
+	{
+		ComputeRealizedAccelerations(M, D, State->PreStepQvel.GetData(), /*bSwapQvel=*/!bRungeKutta, State->Scratch.GetData());
+	}
+	else
+	{
+		// Explicit, or nothing to tell what this pass applied: the forward pass's own accelerations.
+		const bool bSwap = bOneStep && !bRungeKutta;
+		EnsureAccelerations(M, D, bSwap ? State->PreStepQvel.GetData() : nullptr, State->Scratch.GetData());
+	}
+	State->LastSampled = D->time;
 
 	for (TPair<int32, FPoint>& Pair : Table.Points)
 	{
 		FPoint& Point = Pair.Value;
-		if (Point.Model == M && Point.NBody == M->nbody)
+		if (Point.Model == M && Point.NBody == M->nbody && ComputeSample(M, D, Point.BodyId, Point.PointInBody, StateTime, Point.Latest))
 		{
-			ComputeSample(M, D, Point.BodyId, Point.PointInBody, Point.Latest);
+			FMemory::Memcpy(Point.SampledPose, D->xpos + 3 * Point.BodyId, sizeof(double) * 3);
+			FMemory::Memcpy(Point.SampledPose + 3, D->xquat + 4 * Point.BodyId, sizeof(double) * 4);
+			Point.History.Push(Point.Latest); // sized on the game thread: no allocation here
 		}
 	}
 }
