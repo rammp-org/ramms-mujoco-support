@@ -150,7 +150,7 @@ namespace RammsMjWorldGenExportTest
 	}
 
 	/** A counter-clockwise (from above) level rectangle at height Z. */
-	TArray<FVector> Rect(double X0, double Y0, double X1, double Y1, double Z)
+	TArray<FVector> PrismRect(double X0, double Y0, double X1, double Y1, double Z)
 	{
 		return { FVector(X0, Y0, Z), FVector(X1, Y0, Z), FVector(X1, Y1, Z), FVector(X0, Y1, Z) };
 	}
@@ -159,11 +159,11 @@ namespace RammsMjWorldGenExportTest
 	FString PotholeParts()
 	{
 		return PrismParts({
-			{ TEXT("Asphalt"), Rect(0.0, 0.0, 400.0, 100.0, 0.0) },
-			{ TEXT("Asphalt"), Rect(0.0, 200.0, 400.0, 300.0, 0.0) },
-			{ TEXT("Asphalt"), Rect(0.0, 100.0, 150.0, 200.0, 0.0) },
-			{ TEXT("Asphalt"), Rect(250.0, 100.0, 400.0, 200.0, 0.0) },
-			{ TEXT("Asphalt"), Rect(150.0, 100.0, 250.0, 200.0, -6.0) },
+			{ TEXT("Asphalt"), PrismRect(0.0, 0.0, 400.0, 100.0, 0.0) },
+			{ TEXT("Asphalt"), PrismRect(0.0, 200.0, 400.0, 300.0, 0.0) },
+			{ TEXT("Asphalt"), PrismRect(0.0, 100.0, 150.0, 200.0, 0.0) },
+			{ TEXT("Asphalt"), PrismRect(250.0, 100.0, 400.0, 200.0, 0.0) },
+			{ TEXT("Asphalt"), PrismRect(150.0, 100.0, 250.0, 200.0, -6.0) },
 		});
 	}
 
@@ -226,7 +226,7 @@ bool FRammsMjWorldGenExportTest::RunTest(const FString& Parameters)
 	// The ground kinds of graded streets: boxes, hulls, prism fans and two-row height fields.
 	Add(TEXT("GroundPrisms level rectangle"), ERammsProcPieceKind::GroundPrisms, FRotator(0.0, 25.0, 0.0), [](ARammsProcPiece& P) {
 		P.SizeZ = 20.0;
-		P.Parts = PrismParts({ { TEXT("Concrete"), Rect(0.0, 0.0, 200.0, 150.0, 0.0) } });
+		P.Parts = PrismParts({ { TEXT("Concrete"), PrismRect(0.0, 0.0, 200.0, 150.0, 0.0) } });
 	});
 	Add(TEXT("GroundPrisms sloped, pitched and rolled"), ERammsProcPieceKind::GroundPrisms, FRotator(3.0, -20.0, 2.0), [](ARammsProcPiece& P) {
 		P.SizeZ = 15.0;
@@ -628,7 +628,7 @@ bool FRammsMjWorldGenSeamTest::RunTest(const FString& Parameters)
 	Pavers->Kind = ERammsProcPieceKind::GroundPrisms;
 	Pavers->KindId = -1;
 	Pavers->SizeZ = 10.0;
-	Pavers->Parts = PrismParts({ { TEXT("Concrete"), Rect(0.0, 0.0, 100.0, 100.0, 0.0) }, { TEXT("Concrete"), Rect(100.0, 0.0, 200.0, 100.0, 0.0) } });
+	Pavers->Parts = PrismParts({ { TEXT("Concrete"), PrismRect(0.0, 0.0, 100.0, 100.0, 0.0) }, { TEXT("Concrete"), PrismRect(100.0, 0.0, 200.0, 100.0, 0.0) } });
 	Pavers->Rebuild();
 	ARammsMjWorldGenContributor* Contributor = Scene.Spawn<ARammsMjWorldGenContributor>(FTransform::Identity);
 	if (!TestNotNull(TEXT("contributor spawns"), Contributor)
