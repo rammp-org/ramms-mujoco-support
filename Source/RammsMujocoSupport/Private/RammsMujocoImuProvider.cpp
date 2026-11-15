@@ -100,6 +100,71 @@ FVector FRammsMujocoImuProvider::QuickConvertPivot(const UMjBody& Body)
 	return FVector::ZeroVector;
 }
 
+FRammsMujocoImuProvider::EBodyScene FRammsMujocoImuProvider::SceneOf(const UMjBody& Body)
+{
+	const UMjPhysicsEngine* Engine = EngineFor(Body);
+	if (!Engine)
+	{
+		return EBodyScene::NoScene;
+	}
+	const mjModel* Model = Engine->GetModel();
+	if (!Model)
+	{
+		// Not compiled yet, or its compile failed: nothing steps.
+		return Body.GetMocap() ? EBodyScene::Posed : EBodyScene::NotCompiled;
+	}
+	const TOptional<int32>& Bound = Body.GetBoundId();
+	if (!Bound.IsSet() || Bound.GetValue() < 0 || Bound.GetValue() >= Model->nbody)
+	{
+		return EBodyScene::LeftOut; // the compiled scene has no such body (a recompile left it out)
+	}
+	return IsMocapDriven(Model, Bound.GetValue()) ? EBodyScene::Posed : EBodyScene::Simulated;
+}
+
+bool FRammsMujocoImuProvider::ResolveOnBody(UMjBody& Body, USceneComponent& Component, FName Bone, const FTransform& LocalPose, int32 Depth,
+	bool bListing, FRammsImuBodyRef& OutRef)
+{
+	const FTransform SensorWorld = LocalPose * RammsImuProviders::ComponentFrame(Component, Bone);
+	FTransform		 BodyFrame = Body.GetComponentTransform();
+	BodyFrame.SetScale3D(FVector::OneVector);
+	const FTransform PointInComponent = SensorWorld.GetRelativeTransform(BodyFrame);
+
+	OutRef.Bone = NAME_None;
+	OutRef.BodyName = BodyNameOf(Body);
+	OutRef.Depth = Depth;
+
+	// A URLab robot that Chaos simulates: the Chaos body that carries this one serves the point.
+	const AActor* Owner = Body.GetOwner();
+	if (const URammsChaosArticulationComponent* OnChaos = Owner ? Owner->FindComponentByClass<URammsChaosArticulationComponent>() : nullptr;
+		OnChaos && OnChaos->IsBuilt())
+	{
+		URammsChaosBodyComponent* ChaosBody = nullptr;
+		FTransform				  InChaosBody;
+		if (!OnChaos->FindChaosBody(&Body, ChaosBody, InChaosBody))
+		{
+			return false;
+		}
+		OutRef.Source = ERammsImuSource::Chaos;
+		OutRef.Body = ChaosBody;
+		OutRef.PointInBody = PointInComponent * InChaosBody;
+		return true;
+	}
+
+	// Else MuJoCo, only while its compiled scene simulates the body: until the scene compiles (or when its compile
+	// failed), and once a recompile leaves the body out, another engine or Kinematic serves the point (the subsystem
+	// asks again every second). A listing names a body of a scene not compiled yet too. A body Unreal poses (a mocap
+	// body, or one welded to it) MuJoCo reports as still: Kinematic serves it.
+	const EBodyScene Scene = SceneOf(Body);
+	if (!(Scene == EBodyScene::Simulated || (bListing && Scene == EBodyScene::NotCompiled)))
+	{
+		return false;
+	}
+	OutRef.Source = ERammsImuSource::MuJoCo;
+	OutRef.Body = &Body;
+	OutRef.PointInBody = PointInComponent;
+	return true;
+}
+
 bool FRammsMujocoImuProvider::Resolve(USceneComponent& Component, FName Bone, const FTransform& LocalPose, bool /*bExplicit*/,
 	FRammsImuBodyRef& OutRef) const
 {
@@ -111,54 +176,7 @@ bool FRammsMujocoImuProvider::Resolve(USceneComponent& Component, FName Bone, co
 		Body = Cast<UMjBody>(Node);
 		Depth += Body ? 0 : 1;
 	}
-	if (!Body)
-	{
-		return false;
-	}
-	const FTransform SensorWorld = LocalPose * RammsImuProviders::ComponentFrame(Component, Bone);
-	FTransform		 BodyFrame = Body->GetComponentTransform();
-	BodyFrame.SetScale3D(FVector::OneVector);
-	const FTransform PointInComponent = SensorWorld.GetRelativeTransform(BodyFrame);
-
-	OutRef.Bone = NAME_None;
-	OutRef.BodyName = BodyNameOf(*Body);
-	OutRef.Depth = Depth;
-
-	// A URLab robot that Chaos simulates: the Chaos body that carries this one serves the point.
-	const AActor* Owner = Body->GetOwner();
-	if (const URammsChaosArticulationComponent* OnChaos = Owner ? Owner->FindComponentByClass<URammsChaosArticulationComponent>() : nullptr;
-		OnChaos && OnChaos->IsBuilt())
-	{
-		URammsChaosBodyComponent* ChaosBody = nullptr;
-		FTransform				  InChaosBody;
-		if (!OnChaos->FindChaosBody(Body, ChaosBody, InChaosBody))
-		{
-			return false;
-		}
-		OutRef.Source = ERammsImuSource::Chaos;
-		OutRef.Body = ChaosBody;
-		OutRef.PointInBody = PointInComponent * InChaosBody;
-		return true;
-	}
-
-	// Else MuJoCo, when this world has a MuJoCo scene (it may not have compiled yet: the point waits for it). A body
-	// Unreal poses (a mocap body, or one welded to it) MuJoCo reports as still: Kinematic serves it.
-	const UMjPhysicsEngine* Engine = EngineFor(*Body);
-	if (!Engine)
-	{
-		return false;
-	}
-	const mjModel*			Model = Engine->GetModel();
-	const TOptional<int32>& Bound = Body->GetBoundId();
-	const bool				bCompiled = Model && Bound.IsSet() && Bound.GetValue() >= 0 && Bound.GetValue() < Model->nbody;
-	if (bCompiled ? IsMocapDriven(Model, Bound.GetValue()) : Body->GetMocap())
-	{
-		return false;
-	}
-	OutRef.Source = ERammsImuSource::MuJoCo;
-	OutRef.Body = Body;
-	OutRef.PointInBody = PointInComponent;
-	return true;
+	return Body && ResolveOnBody(*Body, Component, Bone, LocalPose, Depth, /*bListing=*/false, OutRef);
 }
 
 int32 FRammsMujocoImuProvider::Track(const FRammsImuBodyRef& Ref)
@@ -207,16 +225,12 @@ void FRammsMujocoImuProvider::Untrack(int32 Handle)
 
 bool FRammsMujocoImuProvider::IsTrackValid(int32 Handle) const
 {
-	// The body is gone, the scene is gone (its manager destroyed), Chaos now simulates the robot, or Unreal poses
-	// the body: another provider serves the point (the subsystem resolves it again).
+	// The body is gone, Chaos now simulates the robot, or the compiled scene no longer simulates the body (the scene
+	// is gone, a recompile left the body out or failed, Unreal poses it): another provider serves the point (the
+	// subsystem resolves it again).
 	const FTracked* Entry = Tracked.Find(Handle);
 	const UMjBody*	Body = Entry ? Entry->Body.Get() : nullptr;
 	if (!Body)
-	{
-		return false;
-	}
-	const UMjPhysicsEngine* Engine = EngineFor(*Body);
-	if (!Engine)
 	{
 		return false;
 	}
@@ -226,9 +240,7 @@ bool FRammsMujocoImuProvider::IsTrackValid(int32 Handle) const
 	{
 		return false;
 	}
-	const mjModel*			Model = Engine->GetModel();
-	const TOptional<int32>& Bound = Body->GetBoundId();
-	return !(Model && Bound.IsSet() && Bound.GetValue() >= 0 && Bound.GetValue() < Model->nbody && IsMocapDriven(Model, Bound.GetValue()));
+	return SceneOf(*Body) == EBodyScene::Simulated;
 }
 
 void FRammsMujocoImuProvider::SetHistoryCapacity(int32 Handle, int32 Capacity)
@@ -341,7 +353,8 @@ void FRammsMujocoImuProvider::ListBodies(AActor& Actor, TArray<FRammsImuBodyRef>
 	Actor.GetAttachedActors(Actors, /*bResetArray=*/true, /*bRecursivelyIncludeAttachedActors=*/true);
 	Actors.Insert(&Actor, 0);
 
-	// Bound bodies in MuJoCo's order (parents first: the base leads), then any not compiled yet by attach depth.
+	// Bound bodies in MuJoCo's order (parents first: the base leads), then any of a scene not compiled yet (listed so
+	// they can be named; until it compiles they read Kinematic) by attach depth.
 	TArray<TPair<int64, FRammsImuBodyRef>> Found;
 	for (AActor* Each : Actors)
 	{
@@ -353,7 +366,7 @@ void FRammsMujocoImuProvider::ListBodies(AActor& Actor, TArray<FRammsImuBodyRef>
 		for (UMjBody* Body : Bodies)
 		{
 			FRammsImuBodyRef Ref;
-			if (!IsValid(Body) || !Resolve(*Body, NAME_None, FTransform::Identity, false, Ref))
+			if (!IsValid(Body) || !ResolveOnBody(*Body, *Body, NAME_None, FTransform::Identity, 0, /*bListing=*/true, Ref))
 			{
 				continue;
 			}
@@ -412,9 +425,9 @@ bool FRammsMujocoImuProvider::IsMocapDriven(const mjModel* M, int32 BodyId)
 	return false; // welded to the world: still, and simulated as such
 }
 
-void FRammsMujocoImuProvider::EnsureAccelerations(const mjModel* M, mjData* D, const double* PreStepQvel, double* Scratch)
+void FRammsMujocoImuProvider::EnsureAccelerations(const mjModel* M, mjData* D, const double* PreStepQvel, double* Scratch, bool bRecompute)
 {
-	if (!M || !D || D->flg_rnepost)
+	if (!M || !D || (D->flg_rnepost && !bRecompute))
 	{
 		return; // the step's own acceleration-stage sensors computed cacc for the step's state
 	}
@@ -583,14 +596,18 @@ void FRammsMujocoImuProvider::PostStep(FTable& Table, const mjModel* M, mjData* 
 	}
 	bool bAny = false;
 	bool bUnsampled = false;
-	bool bMoved = false; // a body's pose differs from its last sample's (a paused scene edited)
+	bool bMoved = false; // a sampled body's pose differs from its last sample's (a paused scene edited)
 	for (const TPair<int32, FPoint>& Pair : Table.Points)
 	{
 		const FPoint& Point = Pair.Value;
 		if (Point.Model == M && Point.NBody == M->nbody && Point.BodyId >= 0 && Point.BodyId < M->nbody)
 		{
 			bAny = true;
-			bUnsampled |= !Point.Latest.bValid;
+			if (!Point.Latest.bValid)
+			{
+				bUnsampled = true; // (its SampledPose is no pose of this scene's to compare with)
+				continue;
+			}
 			const mjtNum* Pos = D->xpos + 3 * Point.BodyId;
 			const mjtNum* Quat = D->xquat + 4 * Point.BodyId;
 			for (int32 i = 0; i < 3 && !bMoved; ++i)
@@ -623,29 +640,50 @@ void FRammsMujocoImuProvider::PostStep(FTable& Table, const mjModel* M, mjData* 
 	const bool	 bOneStep = bStepped && State->PreStepQvel.Num() == M->nv && FMath::IsNearlyEqual(D->time, State->PreStepTime + Timestep, TimeSlack);
 	const bool	 bRungeKutta = M->opt.integrator == mjINT_RK4;
 
+	// Only a new point to sample, and nothing has run since the last pass that sampled (the scene paused): the derived
+	// quantities and cacc are still what that pass left, so the new point is sampled from them and stamped as that
+	// pass stamped its own; the points already sampled keep their samples.
+	const bool bOnlyNew = !bStepped && !bMoved && D == State->SampledData && D->time == State->LastSampled && State->DerivedTime >= 0.0;
+
 	// The time of the state the derived quantities describe: the start of the last step (its forward pass); RK4's
-	// last stage evaluated them at the end; without a step, the current time.
+	// last stage evaluated them at the end; without a step, the current time (a reset, a restore or an edit ran a
+	// forward pass there).
 	double StateTime = D->time;
-	if (bStepped && !bRungeKutta)
+	if (bOnlyNew)
+	{
+		StateTime = State->DerivedTime;
+	}
+	else if (bStepped && !bRungeKutta)
 	{
 		StateTime = bOneStep ? State->PreStepTime : D->time - Timestep;
 	}
 
-	if (bOneStep && Table.Acceleration == ERammsMjImuAcceleration::Realized)
+	if (bOnlyNew)
+	{
+		// cacc is still the last pass's: nothing to compute.
+	}
+	else if (bOneStep && Table.Acceleration == ERammsMjImuAcceleration::Realized)
 	{
 		ComputeRealizedAccelerations(M, D, State->PreStepQvel.GetData(), /*bSwapQvel=*/!bRungeKutta, State->Scratch.GetData());
 	}
 	else
 	{
-		// Explicit, or nothing to tell what this pass applied: the forward pass's own accelerations.
+		// Explicit, or nothing to tell what this pass applied: the forward pass's own accelerations. RK4's later
+		// stages skip the sensors, so its flg_rnepost (and cacc) may be the first stage's: computed again.
 		const bool bSwap = bOneStep && !bRungeKutta;
-		EnsureAccelerations(M, D, bSwap ? State->PreStepQvel.GetData() : nullptr, State->Scratch.GetData());
+		EnsureAccelerations(M, D, bSwap ? State->PreStepQvel.GetData() : nullptr, State->Scratch.GetData(), /*bRecompute=*/bRungeKutta);
 	}
 	State->LastSampled = D->time;
+	State->DerivedTime = StateTime;
+	State->SampledData = D;
 
 	for (TPair<int32, FPoint>& Pair : Table.Points)
 	{
 		FPoint& Point = Pair.Value;
+		if (bOnlyNew && Point.Latest.bValid)
+		{
+			continue;
+		}
 		if (Point.Model == M && Point.NBody == M->nbody && ComputeSample(M, D, Point.BodyId, Point.PointInBody, StateTime, Point.Latest))
 		{
 			FMemory::Memcpy(Point.SampledPose, D->xpos + 3 * Point.BodyId, sizeof(double) * 3);
