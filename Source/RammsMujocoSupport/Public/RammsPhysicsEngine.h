@@ -76,6 +76,14 @@ public:
 	/** The run's override (-RammsPhysics= or ramms.Physics.Engine), else the level's ARammsPhysicsSettings. */
 	static ERammsLevelPhysicsEngine ResolveEngine(const UWorld& World, bool* bOutStartMuJoCoRunning = nullptr, bool* bOutMuJoCoGround = nullptr);
 
+	/**
+	 * One ARammsMjWorldGenContributor per world generator that no contributor in the level exports yet (as
+	 * ramms.mj.WorldShapes and ARammsPhysicsSettings::bMuJoCoWorldShapes allow). A contributor with no Generator
+	 * exports every piece in the level, so with one present none is added. Returns how many were added. Called when a
+	 * level starts on MuJoCo.
+	 */
+	static int32 AddWorldGenContributors(UWorld& World);
+
 	virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
 	virtual void OnWorldBeginPlay(UWorld& World) override;
 	virtual void Deinitialize() override;
