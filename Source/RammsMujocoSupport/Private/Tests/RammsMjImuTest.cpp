@@ -7,8 +7,10 @@
 // two are compared in Unreal units and axes. This pins the gravity convention (+|g| up at rest, 0 in free fall), the
 // lever arm, the axis conversions and the step timing of cacc. A damped slider under implicitfast, where the forward
 // pass's qacc is several times what the step applies, tells the two conventions apart; RK4's stamp and acceleration
-// are checked too. Then: which bodies Unreal poses (mocap), and which engine Auto picks for a point under a URLab body
-// (and picks again when the MuJoCo scene goes).
+// are checked too, and RK4 under Explicit reads the same with or without an accelerometer in the model (its first
+// stage's flg_rnepost is not trusted). A point added while the scene is paused is sampled from what the last step
+// left. Then: which bodies Unreal poses (mocap), and which engine Auto picks for a point under a URLab body (none
+// until its scene compiles: Kinematic meanwhile).
 
 #include "CoreMinimal.h"
 #include "Components/SceneComponent.h"
@@ -70,6 +72,38 @@ namespace RammsMjImuTest
     <gyro site="imu"/>
     <velocimeter site="imu"/>
   </sensor>
+</mujoco>
+)MJCF";
+
+	/** The free box of ImuModelXml under RK4 with an accelerometer on its site: MuJoCo's own sensors set flg_rnepost in
+	 *  RK4's first stage only, and the later stages leave it set. */
+	const char* const RungeKuttaSensorXml = R"MJCF(
+<mujoco>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+  <worldbody>
+    <body name="box" pos="0 0 2">
+      <freejoint/>
+      <geom type="box" size="0.1 0.2 0.3" mass="2"/>
+      <site name="imu" pos="0.05 -0.1 0.15" quat="0.9238795 0.2 0.3 0.1"/>
+    </body>
+  </worldbody>
+  <sensor>
+    <accelerometer site="imu"/>
+  </sensor>
+</mujoco>
+)MJCF";
+
+	/** The same without the sensor. */
+	const char* const RungeKuttaBareXml = R"MJCF(
+<mujoco>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+  <worldbody>
+    <body name="box" pos="0 0 2">
+      <freejoint/>
+      <geom type="box" size="0.1 0.2 0.3" mass="2"/>
+      <site name="imu" pos="0.05 -0.1 0.15" quat="0.9238795 0.2 0.3 0.1"/>
+    </body>
+  </worldbody>
 </mujoco>
 )MJCF";
 
@@ -181,6 +215,10 @@ namespace RammsMjImuTest
 
 	FMuJoCoReadings ReadSensors(const FImuModel& Imu)
 	{
+		if (Imu.Model->nsensor < 3)
+		{
+			return FMuJoCoReadings{ FVector::ZeroVector, FVector::ZeroVector, FVector::ZeroVector }; // not the IMU models' three sensors
+		}
 		const mjtNum*	Data = Imu.Data->sensordata;
 		const int32		Accel = Imu.Model->sensor_adr[0];
 		const int32		Gyro = Imu.Model->sensor_adr[1];
@@ -220,11 +258,12 @@ namespace RammsMjImuTest
 	/**
 	 * Step Imu's model Steps times with the provider's callbacks around each step, as URLab's worker runs them, the
 	 * site Site on body Body tracked as point 1 under Convention. MuJoCo's own accelerometer computes cacc in the step:
-	 * flg_rnepost is cleared, so the callback computes its own. Returns each step's sample and, per step, the time the
-	 * step started and MuJoCo's sensor readings (the step's forward pass).
+	 * with bClearRnePost flg_rnepost is cleared, so the callback computes its own (without, the callback sees the flag as
+	 * URLab's worker leaves it). Returns each step's sample and, per step, the time the step started and MuJoCo's
+	 * sensor readings (the step's forward pass; zeros for a model without the three IMU sensors).
 	 */
 	void RunSteps(FAutomationTestBase& Test, const FImuModel& Imu, int32 Body, int32 Site, ERammsMjImuAcceleration Convention, int32 Steps,
-		TArray<FRammsImuSample>& OutSamples, TArray<double>& OutStepStarts, TArray<FMuJoCoReadings>& OutReadings)
+		TArray<FRammsImuSample>& OutSamples, TArray<double>& OutStepStarts, TArray<FMuJoCoReadings>& OutReadings, bool bClearRnePost = true)
 	{
 		FRammsMujocoImuProvider::FTable	 Table;
 		FRammsMujocoImuProvider::FPoint& Point = Table.Points.Add(1);
@@ -238,7 +277,10 @@ namespace RammsMjImuTest
 			const double StepStart = Imu.Data->time;
 			FRammsMujocoImuProvider::PreStep(Table, Imu.Model, Imu.Data);
 			mj_step(Imu.Model, Imu.Data);
-			Imu.Data->flg_rnepost = 0;
+			if (bClearRnePost)
+			{
+				Imu.Data->flg_rnepost = 0;
+			}
 			const TArray<double> QvelAfter(Imu.Data->qvel, Imu.Model->nv);
 			const TArray<double> QaccAfter(Imu.Data->qacc, Imu.Model->nv);
 			FRammsMujocoImuProvider::PostStep(Table, Imu.Model, Imu.Data);
@@ -475,6 +517,116 @@ bool FRammsMjImuRungeKuttaTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRammsMjImuRungeKuttaExplicitTest, "Ramms.MuJoCo.Imu.RungeKuttaExplicit",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FRammsMjImuRungeKuttaExplicitTest::RunTest(const FString& Parameters)
+{
+	using namespace RammsMjImuTest;
+	constexpr int32 Steps = 10;
+
+	// The spinning, falling box under RK4 and the Explicit convention, with and without an accelerometer in the
+	// model. The sensor does not change the motion; MuJoCo's sensors run in RK4's first stage only, which leaves
+	// flg_rnepost set (and cacc the first stage's) while the pose and velocities are the last stage's. The provider
+	// must not trust that flag: the two models read the same.
+	TArray<FRammsImuSample> Readings[2];
+	const char* const		Models[2] = { RungeKuttaSensorXml, RungeKuttaBareXml };
+	for (int32 m = 0; m < 2; ++m)
+	{
+		FImuModel Imu(Models[m]);
+		if (!TestTrue(FString::Printf(TEXT("the RK4 model %d compiles (%s)"), m, *Imu.Error), Imu.Data != nullptr))
+		{
+			return false;
+		}
+		Imu.Throw();
+		TArray<double>			StepStarts;
+		TArray<FMuJoCoReadings> Unused;
+		RunSteps(*this, Imu, Imu.Id(mjOBJ_BODY, "box"), Imu.Id(mjOBJ_SITE, "imu"), ERammsMjImuAcceleration::Explicit, Steps, Readings[m], StepStarts, Unused,
+			/*bClearRnePost=*/false);
+		if (m == 0)
+		{
+			// The case this checks: a raw RK4 step leaves the first stage's flag set.
+			mj_step(Imu.Model, Imu.Data);
+			TestTrue(TEXT("RK4 with an accelerometer leaves flg_rnepost set"), Imu.Data->flg_rnepost != 0);
+		}
+	}
+	if (Readings[0].Num() != Steps || Readings[1].Num() != Steps)
+	{
+		return false;
+	}
+	for (int32 Step = 0; Step < Steps; ++Step)
+	{
+		const FRammsImuSample& WithSensor = Readings[0][Step];
+		const FRammsImuSample& Bare = Readings[1][Step];
+		const double		   Slack = 1.0e-6 * FMath::Max(1.0, Bare.ProperAcceleration.GetAbsMax());
+		NearlyEqualVectors(*this, FString::Printf(TEXT("step %d: the same acceleration with an accelerometer in the model"), Step), WithSensor.ProperAcceleration,
+			Bare.ProperAcceleration, Slack);
+		NearlyEqualVectors(*this, FString::Printf(TEXT("step %d: the same angular acceleration"), Step), WithSensor.AngularAcceleration, Bare.AngularAcceleration,
+			1.0e-6 * FMath::Max(1.0, Bare.AngularAcceleration.GetAbsMax()));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRammsMjImuPausedNewPointTest, "Ramms.MuJoCo.Imu.PausedNewPoint",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FRammsMjImuPausedNewPointTest::RunTest(const FString& Parameters)
+{
+	using namespace RammsMjImuTest;
+	FImuModel Imu;
+	if (!TestTrue(FString::Printf(TEXT("the model compiles (%s)"), *Imu.Error), Imu.Data != nullptr))
+	{
+		return false;
+	}
+	Imu.Throw();
+	const int32		 Box = Imu.Id(mjOBJ_BODY, "box");
+	const FTransform SiteInBox = Imu.SiteInBody(Imu.Id(mjOBJ_SITE, "imu"));
+
+	// A point stepped five times under the default (Realized) convention.
+	FRammsMujocoImuProvider::FTable Table;
+	Table.Acceleration = ERammsMjImuAcceleration::Realized;
+	{
+		FRammsMujocoImuProvider::FPoint& First = Table.Points.Add(1);
+		First.Model = Imu.Model;
+		First.NBody = Imu.Model->nbody;
+		First.BodyId = Box;
+		First.PointInBody = SiteInBox;
+		First.History.SetCapacity(16);
+	}
+	double LastStepStart = 0.0;
+	for (int32 Step = 0; Step < 5; ++Step)
+	{
+		LastStepStart = Imu.Data->time;
+		FRammsMujocoImuProvider::PreStep(Table, Imu.Model, Imu.Data);
+		mj_step(Imu.Model, Imu.Data);
+		FRammsMujocoImuProvider::PostStep(Table, Imu.Model, Imu.Data);
+	}
+	const FRammsImuSample Before = Table.Points[1].Latest;
+
+	// The scene pauses and a second point on the same frame is tracked: URLab's loop goes on calling back without a
+	// step. The new point reads the state the last step left, stamped with that step's start, as the first did; the
+	// first keeps its sample.
+	{
+		FRammsMujocoImuProvider::FPoint& Second = Table.Points.Add(2);
+		Second.Model = Imu.Model;
+		Second.NBody = Imu.Model->nbody;
+		Second.BodyId = Box;
+		Second.PointInBody = SiteInBox;
+	}
+	FRammsMujocoImuProvider::PreStep(Table, Imu.Model, Imu.Data);
+	FRammsMujocoImuProvider::PostStep(Table, Imu.Model, Imu.Data);
+	const FRammsImuSample& Added = Table.Points[2].Latest;
+	TestTrue(TEXT("the new point is sampled while paused"), Added.bValid);
+	TestEqual(TEXT("stamped with the last step's start (the state xpos and cvel still describe)"), Added.SimTimeSeconds, LastStepStart, 1.0e-12);
+	NearlyEqualVectors(*this, TEXT("at the first point's place"), Added.Location, Before.Location, 1.0e-9);
+	NearlyEqualVectors(*this, TEXT("at its velocity"), Added.LinearVelocity, Before.LinearVelocity, 1.0e-9);
+	NearlyEqualVectors(*this, TEXT("reading its (realized) acceleration"), Added.ProperAcceleration, Before.ProperAcceleration, 1.0e-6);
+	const FRammsMujocoImuProvider::FPoint& FirstAfter = Table.Points[1];
+	TestEqual(TEXT("the first point keeps its sample"), FirstAfter.Latest.SimTimeSeconds, Before.SimTimeSeconds);
+	TestEqual(TEXT("and its history"), FirstAfter.History.GetNextSeq(), int64(5));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRammsMjImuMocapTest, "Ramms.MuJoCo.Imu.MocapDriven",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
@@ -541,34 +693,45 @@ bool FRammsMjImuSelectionTest::RunTest(const FString& Parameters)
 	Imu->ResolveBody(*Mount, NAME_None, FTransform::Identity, ERammsImuSource::Auto, Ref);
 	TestEqual(TEXT("without a MuJoCo scene: Kinematic"), Ref.Source, ERammsImuSource::Kinematic);
 
-	// With one (compiled or not): MuJoCo, the URLab body being the body, one hop up.
+	TestEqual(TEXT("no scene"), FRammsMujocoImuProvider::SceneOf(*Chassis), FRammsMujocoImuProvider::EBodyScene::NoScene);
+
+	// With a scene that has not compiled (or whose compile failed) nothing steps either: Kinematic, so the point has
+	// samples meanwhile; the subsystem asks again every second and moves it to MuJoCo once the scene has the body.
 	AAMjManager* Manager = World->SpawnActor<AAMjManager>();
+	TestEqual(TEXT("a scene not compiled"), FRammsMujocoImuProvider::SceneOf(*Chassis), FRammsMujocoImuProvider::EBodyScene::NotCompiled);
 	Imu->ResolveBody(*Mount, NAME_None, FTransform(FVector(5.0, 0.0, 0.0)), ERammsImuSource::Auto, Ref);
-	TestEqual(TEXT("Auto picks MuJoCo under a URLab body"), Ref.Source, ERammsImuSource::MuJoCo);
+	TestEqual(TEXT("an uncompiled scene serves nothing: Kinematic"), Ref.Source, ERammsImuSource::Kinematic);
+	Imu->ResolveBody(*Mount, NAME_None, FTransform::Identity, ERammsImuSource::MuJoCo, Ref);
+	TestEqual(TEXT("asked for MuJoCo by name: Kinematic too"), Ref.Source, ERammsImuSource::Kinematic);
+
+	// The frame MuJoCo would serve: the URLab body being the body, one hop up, named by its MJCF name.
+	TestTrue(TEXT("resolves on the body"),
+		FRammsMujocoImuProvider::ResolveOnBody(*Chassis, *Mount, NAME_None, FTransform(FVector(5.0, 0.0, 0.0)), 1, /*bListing=*/true, Ref));
+	TestEqual(TEXT("MuJoCo's"), Ref.Source, ERammsImuSource::MuJoCo);
 	TestTrue(TEXT("the URLab body is the body"), Ref.Body.Get() == Chassis);
 	TestEqual(TEXT("one hop up"), Ref.Depth, 1);
 	TestEqual(TEXT("named by its MJCF name"), Ref.BodyName, FString(TEXT("chassis")));
 	NearlyEqualVectors(*this, TEXT("the point in the body's frame"), Ref.PointInBody.GetLocation(), FVector(15.0, 0.0, 20.0), 1.0e-6);
+	TestFalse(TEXT("but not to serve it"), FRammsMujocoImuProvider::ResolveOnBody(*Chassis, *Mount, NAME_None, FTransform::Identity, 1, /*bListing=*/false, Ref));
 
-	// Tracked: MuJoCo, with no sample until the scene compiles and steps.
+	// Tracked: Kinematic, with a sample at once.
 	const int32 Handle = Imu->Track(Mount, FVector::ZeroVector);
-	TestEqual(TEXT("tracked on MuJoCo"), Imu->GetTrackedSource(Handle), ERammsImuSource::MuJoCo);
+	TestEqual(TEXT("tracked on Kinematic until the scene compiles"), Imu->GetTrackedSource(Handle), ERammsImuSource::Kinematic);
 	FRammsImuSample Sample;
-	TestFalse(TEXT("no sample before the scene steps"), Imu->GetSample(Handle, Sample));
+	TestTrue(TEXT("a sample before the scene steps"), Imu->GetSample(Handle, Sample) && Sample.bValid);
 
-	// Listed by its MJCF name.
+	// Listed by its MJCF name (so it can be named before the scene compiles).
 	TArray<FRammsImuBodyRef> Bodies;
 	Imu->ListBodies(*Robot, Bodies);
 	TestTrue(TEXT("the chassis is listed on MuJoCo"), Bodies.Num() >= 1 && Bodies[0].BodyName == TEXT("chassis") && Bodies[0].Source == ERammsImuSource::MuJoCo);
 
-	// The MuJoCo scene goes (its manager destroyed, as a level switched to Chaos does): the point is no longer
-	// MuJoCo's, and the subsystem moves it to what serves it now.
+	// The MuJoCo scene goes (its manager destroyed, as a level switched to Chaos does): still Kinematic.
 	if (Manager)
 	{
 		Manager->Destroy();
 	}
 	Imu->RefreshPoints(/*bForceResolve=*/true);
-	TestEqual(TEXT("without its scene the point falls back to Kinematic"), Imu->GetTrackedSource(Handle), ERammsImuSource::Kinematic);
+	TestEqual(TEXT("without its scene the point stays Kinematic"), Imu->GetTrackedSource(Handle), ERammsImuSource::Kinematic);
 	Imu->Untrack(Handle);
 	return true;
 }
