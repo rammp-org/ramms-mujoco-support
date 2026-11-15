@@ -4,6 +4,8 @@
 #include "RammsActuationBackend.h"
 #include "RammsActuationBackendRegistry.h"
 #include "RammsArticulationActuationBackend.h"
+#include "RammsImuProvider.h"
+#include "RammsMujocoImuProvider.h"
 
 /**
  * RammsMujocoSupport module. On startup it registers the MuJoCo actuation-backend
@@ -20,12 +22,15 @@ public:
 			FRammsActuationBackendFactory::CreateStatic(&FRammsMujocoSupportModule::CreateMujocoBackend));
 		RammsActuationBackends::RegisterChaosArticulationFactory(
 			FRammsActuationBackendFactory::CreateStatic(&FRammsMujocoSupportModule::CreateChaosArticulationBackend));
+		// Physics-rate IMU data from MuJoCo (URammsPhysicsImuSubsystem picks it for a sensor on a URLab body).
+		RammsImuProviders::Register(ERammsImuSource::MuJoCo, FRammsImuProviderFactory::CreateStatic(&MakeRammsMujocoImuProvider));
 	}
 
 	virtual void ShutdownModule() override
 	{
 		RammsActuationBackends::UnregisterMujocoFactory();
 		RammsActuationBackends::UnregisterChaosArticulationFactory();
+		RammsImuProviders::Unregister(ERammsImuSource::MuJoCo);
 	}
 
 private:
