@@ -168,6 +168,9 @@ MuJoCo's cell diagonals, spheres and capsules magenta; `2` draws them over every
 (and pitched, rolled and scaled pieces), and compares MuJoCo's own ray (`mj_ray`) with Chaos's trace of each
 piece: within 2 mm. `Ramms.MuJoCo.WorldGenExport.NoDoubleExport` checks that no generator gets two
 contributors (nor any, beside one with no `Generator`) and that quick-converted actors are left out.
-`Ramms.MuJoCo.WorldGenExport.SeamContacts` measures, and only reports, how far contact normals lean sideways
-where a sphere, a wheel-like cylinder and a roller pad cross the seam between two coplanar exported boxes, 2 mm
-into them: separate geoms meeting at a seam can give the far geom's edge a contact whose normal is not vertical.
+`Ramms.MuJoCo.WorldGenExport.SeamContacts` sweeps a sphere, a wheel-like cylinder and a roller pad, 2 mm in,
+across where two pavers meet. Separate geoms meeting at a seam give the far one's edge a contact whose normal
+leans sideways (measured before the fix: 0.28 of the sphere's, 0.19 of the wheel's, all of the roller pad's), so
+flush neighbours are exported as one geom (RammsWorldGen merges flush GroundPrisms parts and flush boxes): across
+flush pavers the test requires no lean over 0.01, and at a 6 mm lip it requires the step to remain (sphere at
+least 0.4, wheel 0.25, roller pad 0.9).

@@ -521,10 +521,16 @@ void ARammsMjWorldGenContributor::GatherShapes(TArray<FRammsCollisionShape>& Out
 		Generator->GatherCollisionShapes(Out, Filter);
 		return;
 	}
-	// No generator: every procedural piece in the level (hand-placed pieces, tests).
+	// No generator: every procedural piece in the level (hand-placed pieces, tests), flush boxes merged as the
+	// generator merges them (no seams between them for a body to catch).
 	if (UWorld* World = GetWorld())
 	{
+		const int32 First = Out.Num();
 		GatherAllPieces(*World, Filter, Out, /*bStopAtFirst=*/false);
+		if (Filter.bMergeFlushBoxes)
+		{
+			RammsCollisionShapes::MergeFlushBoxes(Out, First);
+		}
 	}
 }
 
