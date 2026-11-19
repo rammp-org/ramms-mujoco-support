@@ -11,7 +11,27 @@
 #include "MuJoCo/Elements/MjJointRuntime.h"
 #include "MuJoCo/Spec/MjNodeComponent.h"
 #include "GameFramework/Actor.h"
+#include "HAL/IConsoleManager.h"
 #include "mujoco/mujoco.h"
+
+static TAutoConsoleVariable<int32>	 CVarRammsMjStiffDrive(TEXT("ramms.mj.StiffDrive"), 1,
+	  TEXT("A stiff speed loop (FRammsVelocityGains::StiffDamping): a plain force actuator (<motor>) driven at a speed is made a ")
+		  TEXT("MuJoCo velocity servo for as long as it is -- its damping integrated implicitly by the solver, stable at gains a loop ")
+			  TEXT("closed outside it cannot use -- with the integral on top, within the motor's torque range; a step that would ask ")
+				  TEXT("more than the range runs as the plain motor at its limit. Put back as it was once the loop is dropped. ")
+					  TEXT("1 (the default): for the motors whose gains ask for it; 0: for none; 2 (experiments): also for every motor named ")
+						  TEXT("in ramms.mj.StiffDriveMotors, at ramms.mj.StiffDriveDamping / StiffDriveIntegral."),
+	  ECVF_Default);
+static TAutoConsoleVariable<FString> CVarRammsMjStiffDriveMotors(TEXT("ramms.mj.StiffDriveMotors"), TEXT("omni"),
+	TEXT("With ramms.mj.StiffDrive 2: the motors whose registry Id contains one of these (comma-separated, any case; empty: ")
+		TEXT("every one) get a stiff loop at the gains below."),
+	ECVF_Default);
+static TAutoConsoleVariable<float>	 CVarRammsMjStiffDriveDamping(TEXT("ramms.mj.StiffDriveDamping"), 60.0f,
+	  TEXT("With ramms.mj.StiffDrive 2: the servo's damping at the joint (N*m per rad/s; N per m/s on a slide)."), ECVF_Default);
+static TAutoConsoleVariable<float>	 CVarRammsMjStiffDriveIntegral(TEXT("ramms.mj.StiffDriveIntegral"), 1000.0f,
+	  TEXT("With ramms.mj.StiffDrive 2: the integral gain at the joint (N*m per rad behind the command), up to the motor's own ")
+		  TEXT("integral cap (FRammsVelocityGains::MaxIntegralTorque)."),
+	  ECVF_Default);
 
 bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
 {
@@ -355,7 +375,8 @@ bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetR
 		// accumulated under the old gains would be applied at once under the new
 		// ones (and never bleed off with Ki 0). The same gains arrive every tick,
 		// so this only fires on a real change.
-		if (Drive.Kp != Gains.Kp || Drive.Ki != Gains.Ki || Drive.MaxIntegral != Gains.MaxIntegralTorque)
+		if (Drive.Kp != Gains.Kp || Drive.Ki != Gains.Ki || Drive.MaxIntegral != Gains.MaxIntegralTorque
+			|| Drive.StiffKdGiven != Gains.StiffDamping || Drive.StiffKiGiven != Gains.StiffIntegral)
 		{
 			Drive.Integral = 0.0;
 		}
@@ -367,18 +388,54 @@ bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetR
 		Drive.Kp = Gains.Kp;
 		Drive.Ki = Gains.Ki;
 		Drive.MaxIntegral = Gains.MaxIntegralTorque;
+		Drive.StiffKdGiven = Gains.StiffDamping;
+		Drive.StiffKiGiven = Gains.StiffIntegral;
 		Drive.Lo = TorqueMin;
 		Drive.Hi = TorqueMax;
+		// A stiff loop: as the motor's gains ask (ramms.mj.StiffDrive 1), none
+		// (0), or -- experiments, 2 -- the motors named in StiffDriveMotors at
+		// the setting's gains.
+		const int32 StiffMode = CVarRammsMjStiffDrive.GetValueOnGameThread();
+		Drive.StiffKd = StiffMode == 0 ? 0.0 : Gains.StiffDamping;
+		Drive.StiffKi = StiffMode == 0 ? 0.0 : Gains.StiffIntegral;
+		if (StiffMode == 2)
+		{
+			TArray<FString> Patterns;
+			CVarRammsMjStiffDriveMotors.GetValueOnGameThread().ParseIntoArray(Patterns, TEXT(","), true);
+			const FString Name = MotorId.ToString();
+			bool		  bNamed = Patterns.Num() == 0;
+			for (const FString& Pattern : Patterns)
+			{
+				bNamed = bNamed || Name.Contains(Pattern.TrimStartAndEnd(), ESearchCase::IgnoreCase);
+			}
+			if (bNamed)
+			{
+				Drive.StiffKd = CVarRammsMjStiffDriveDamping.GetValueOnGameThread();
+				Drive.StiffKi = CVarRammsMjStiffDriveIntegral.GetValueOnGameThread();
+			}
+		}
 	}
 	return true;
 }
 
 void FRammsMujocoActuationBackend::ClearVelocityDrive(FName MotorId)
 {
+	bool bHad = false;
 	if (DriveTable)
 	{
 		FScopeLock Lock(&DriveTable->Lock);
-		DriveTable->Drives.Remove(MotorId);
+		bHad = DriveTable->Drives.Remove(MotorId) > 0;
+	}
+	// What the loop staged last would otherwise go on acting until the motor
+	// is commanded again: its torque, or -- a stiff loop's -- a speed, which
+	// is a torque again once the actuator is put back as a plain motor (a
+	// braked wheel held its loop's last 50 N*m against the brake).
+	if (bHad)
+	{
+		if (UMjNodeComponent* Actuator = ResolveActuator(MotorId))
+		{
+			UMjActuatorRuntime::SetControl(Actuator, 0.0f);
+		}
 	}
 }
 
@@ -485,8 +542,23 @@ bool FRammsMujocoActuationBackend::ResolveBrake(FName MotorId, UMjPhysicsEngine*
 	}
 	// A motor: its force its gain times its command, nothing more. A servo
 	// (position, velocity) or an actuator with dynamics holds by its own law.
-	if (Model->actuator_gaintype[ActuatorId] != mjGAIN_FIXED || Model->actuator_biastype[ActuatorId] != mjBIAS_NONE
-		|| Model->actuator_dyntype[ActuatorId] != mjDYN_NONE)
+	// (A motor a stiff speed loop has made a servo for now is judged as it was
+	// authored: it is put back before the brake takes it.)
+	int32 GainType = Model->actuator_gaintype[ActuatorId];
+	int32 BiasType = Model->actuator_biastype[ActuatorId];
+	if (DriveTable)
+	{
+		FScopeLock Lock(&DriveTable->Lock);
+		if (DriveTable->StiffenedIn == Model)
+		{
+			if (const FStiffened* Was = DriveTable->Stiffened.Find(ActuatorId))
+			{
+				GainType = Was->GainType;
+				BiasType = Was->BiasType;
+			}
+		}
+	}
+	if (GainType != mjGAIN_FIXED || BiasType != mjBIAS_NONE || Model->actuator_dyntype[ActuatorId] != mjDYN_NONE)
 	{
 		return false;
 	}
@@ -597,10 +669,12 @@ void FRammsMujocoActuationBackend::StepTable(FDriveTable& Table, mjModel_* Model
 	{
 		return;
 	}
-	// First, and on a dead table too: it still puts back what it raised.
+	// First, and on a dead table too: it still puts back what it raised (and
+	// what the stiff loops made servos).
 	StepBrakes(Table, Model);
 	if (!Table.bAlive || !Table.Articulation)
 	{
+		RestoreStiffened(Table, Model, nullptr);
 		return;
 	}
 	// The time since the last callback, on the simulation's own clock: none
@@ -720,13 +794,145 @@ void FRammsMujocoActuationBackend::StepProfiles(FDriveTable& Table, const mjMode
 	}
 }
 
-void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt)
+void FRammsMujocoActuationBackend::RestoreStiffened(FDriveTable& Table, mjModel_* Model, const TSet<int32>* Keep)
 {
+	if (Table.StiffenedIn != Model)
+	{
+		// Made servos in a model since recompiled: the new one has its own.
+		Table.Stiffened.Reset();
+		Table.StiffenedIn = Model;
+		return;
+	}
+	for (auto It = Table.Stiffened.CreateIterator(); It; ++It)
+	{
+		const int32 Id = It.Key();
+		if ((Keep && Keep->Contains(Id)) || Id < 0 || Id >= Model->nu)
+		{
+			continue;
+		}
+		const FStiffened& Was = It.Value();
+		Model->actuator_gaintype[Id] = Was.GainType;
+		Model->actuator_biastype[Id] = Was.BiasType;
+		FMemory::Memcpy(&Model->actuator_gainprm[Id * mjNGAIN], Was.GainPrm, sizeof(Was.GainPrm));
+		FMemory::Memcpy(&Model->actuator_biasprm[Id * mjNBIAS], Was.BiasPrm, sizeof(Was.BiasPrm));
+		Model->actuator_forcelimited[Id] = Was.ForceLimited;
+		Model->actuator_forcerange[2 * Id] = Was.ForceRange[0];
+		Model->actuator_forcerange[2 * Id + 1] = Was.ForceRange[1];
+		Model->actuator_ctrllimited[Id] = Was.CtrlLimited;
+		Model->actuator_ctrlrange[2 * Id] = Was.CtrlRange[0];
+		Model->actuator_ctrlrange[2 * Id + 1] = Was.CtrlRange[1];
+		It.RemoveCurrent();
+	}
+}
+
+void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, mjModel_* Model, const mjData_* Data, double Dt)
+{
+	static_assert(sizeof(FStiffened::GainPrm) == mjNGAIN * sizeof(mjtNum), "an actuator's gain parameters");
+	static_assert(sizeof(FStiffened::BiasPrm) == mjNBIAS * sizeof(mjtNum), "an actuator's bias parameters");
+	// (ramms.mj.StiffDrive) Each loop on a plain force actuator made a velocity
+	// servo for the step: force = Kd/g^2 (ctrl - g qvel), with ctrl the joint's
+	// target rate times its gear g plus the integral's share. The solver
+	// (implicitfast) takes the velocity term implicitly, so the damping can be
+	// as stiff as a geared drive: a lifted omni wheel's inertia (~0.03 kg*m^2)
+	// sets a ceiling of about 25 N*m per rad/s on a loop closed outside it.
+	if (Table.StiffenedIn != Model)
+	{
+		RestoreStiffened(Table, Model, nullptr);
+	}
+	TSet<int32> Stiff;
 	for (TPair<FName, FPhysicsDrive>& Pair : Table.Drives)
 	{
 		FPhysicsDrive& Drive = Pair.Value;
 		if (Drive.ActuatorId < 0 || Drive.ActuatorId >= Model->nu || Drive.DofAdr < 0 || Drive.DofAdr >= Model->nv)
 		{
+			continue;
+		}
+		const int32	 Id = Drive.ActuatorId;
+		const double Gear = Model->actuator_gear[6 * Id];
+		const bool	 bOurs = Table.Stiffened.Contains(Id);
+		const bool	 bPlainMotor = Model->actuator_gaintype[Id] == mjGAIN_FIXED && Model->actuator_biastype[Id] == mjBIAS_NONE
+			&& Model->actuator_dyntype[Id] == mjDYN_NONE;
+		if (Drive.StiffKd > 0.0 && FMath::Abs(Gear) > 1e-9 && (bOurs || bPlainMotor))
+		{
+			if (!bOurs)
+			{
+				FStiffened& Was = Table.Stiffened.Add(Id);
+				Was.GainType = Model->actuator_gaintype[Id];
+				Was.BiasType = Model->actuator_biastype[Id];
+				FMemory::Memcpy(Was.GainPrm, &Model->actuator_gainprm[Id * mjNGAIN], sizeof(Was.GainPrm));
+				FMemory::Memcpy(Was.BiasPrm, &Model->actuator_biasprm[Id * mjNBIAS], sizeof(Was.BiasPrm));
+				Was.ForceLimited = Model->actuator_forcelimited[Id];
+				Was.ForceRange[0] = Model->actuator_forcerange[2 * Id];
+				Was.ForceRange[1] = Model->actuator_forcerange[2 * Id + 1];
+				Was.CtrlLimited = Model->actuator_ctrllimited[Id];
+				Was.CtrlRange[0] = Model->actuator_ctrlrange[2 * Id];
+				Was.CtrlRange[1] = Model->actuator_ctrlrange[2 * Id + 1];
+			}
+			Stiff.Add(Id);
+			// The torque range: the loop's (the motor's own), else the force
+			// the plain motor could put out (its gain of 1 times its ctrlrange).
+			const FStiffened& Was = Table.Stiffened[Id];
+			double			  Lo = Drive.Lo, Hi = Drive.Hi;
+			if (!(Lo < Hi))
+			{
+				Lo = Was.CtrlLimited ? Was.CtrlRange[0] * Was.GainPrm[0] : -1e9;
+				Hi = Was.CtrlLimited ? Was.CtrlRange[1] * Was.GainPrm[0] : 1e9;
+				if (Hi < Lo)
+				{
+					Swap(Lo, Hi);
+				}
+			}
+			const double StiffKd = FMath::Max(1.0, Drive.StiffKd);
+			const double StiffKi = FMath::Max(0.0, Drive.StiffKi);
+			const double KdA = StiffKd / (Gear * Gear);
+			// The joint's rate and its target (rad/s; qvel units), and the
+			// integral in the actuator's force: held while the force is at
+			// its limit, so that it does not wind up.
+			const double Qd = Data->qvel[Drive.DofAdr];
+			const double QdTarget = Drive.Target / Drive.Scale;
+			double		 Integral = Drive.Integral + StiffKi / Gear * (QdTarget - Qd) * Dt;
+			if (Drive.MaxIntegral > 0.0)
+			{
+				Integral = FMath::Clamp(Integral, -Drive.MaxIntegral, Drive.MaxIntegral);
+			}
+			const double Force = KdA * Gear * (QdTarget - Qd) + Integral;
+			const bool	 bSaturated = Force < Lo || Force > Hi;
+			if (bSaturated)
+			{
+				Integral = Drive.Integral;
+			}
+			Drive.Integral = Integral;
+			mjtNum* const GainPrm = &Model->actuator_gainprm[Id * mjNGAIN];
+			mjtNum* const BiasPrm = &Model->actuator_biasprm[Id * mjNBIAS];
+			if (bSaturated)
+			{
+				// At the motor's limit the servo would put out a constant force
+				// that the solver still took for a damper (its derivative), and
+				// the wheel chattered from one limit to the other: for this step
+				// the plain motor, at the limit.
+				Model->actuator_gaintype[Id] = Was.GainType;
+				Model->actuator_biastype[Id] = Was.BiasType;
+				FMemory::Memcpy(GainPrm, Was.GainPrm, sizeof(Was.GainPrm));
+				FMemory::Memcpy(BiasPrm, Was.BiasPrm, sizeof(Was.BiasPrm));
+				Model->actuator_forcelimited[Id] = Was.ForceLimited;
+				Model->actuator_forcerange[2 * Id] = Was.ForceRange[0];
+				Model->actuator_forcerange[2 * Id + 1] = Was.ForceRange[1];
+				Model->actuator_ctrllimited[Id] = Was.CtrlLimited;
+				const double Gain = FMath::Abs(Was.GainPrm[0]) > 1e-12 ? Was.GainPrm[0] : 1.0;
+				Table.Articulation->StageInternalControl(Id, FMath::Clamp(Force, Lo, Hi) / Gain);
+				continue;
+			}
+			Model->actuator_gaintype[Id] = mjGAIN_FIXED;
+			Model->actuator_biastype[Id] = mjBIAS_AFFINE;
+			FMemory::Memzero(GainPrm, mjNGAIN * sizeof(mjtNum));
+			FMemory::Memzero(BiasPrm, mjNBIAS * sizeof(mjtNum));
+			GainPrm[0] = KdA;
+			BiasPrm[2] = -KdA;
+			Model->actuator_forcelimited[Id] = true;
+			Model->actuator_forcerange[2 * Id] = Lo;
+			Model->actuator_forcerange[2 * Id + 1] = Hi;
+			Model->actuator_ctrllimited[Id] = false;
+			Table.Articulation->StageInternalControl(Id, Gear * QdTarget + Integral / KdA);
 			continue;
 		}
 		// The same PI the base runs, in the joint's sense: integral capped,
@@ -753,6 +959,10 @@ void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, const mjModel_
 		// write would be overwritten in the same step.
 		Table.Articulation->StageInternalControl(Drive.ActuatorId, Output);
 	}
+	// A loop dropped (released, braked, refused, or the setting off): its
+	// actuator a plain force actuator again before this step, so the base's own
+	// command means a torque once more.
+	RestoreStiffened(Table, Model, &Stiff);
 }
 
 double FRammsMujocoActuationBackend::GetSimulationTime() const

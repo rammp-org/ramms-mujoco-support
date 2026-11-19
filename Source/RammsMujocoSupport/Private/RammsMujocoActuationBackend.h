@@ -131,6 +131,12 @@ private:
 		double Lo = 0.0;
 		double Hi = 0.0;
 		double Integral = 0.0;
+		/** A stiff loop's damping and integral at the joint (0: the plain loop),
+		 *  and the gains' own figures (a change starts the integral over). */
+		double StiffKd = 0.0;
+		double StiffKi = 0.0;
+		float  StiffKdGiven = 0.0f;
+		float  StiffKiGiven = 0.0f;
 	};
 
 	/** One position actuator's profile (SetPositionProfile), as the physics
@@ -185,14 +191,31 @@ private:
 	 * lock rather than freeing anything the physics thread may be reading (the
 	 * callback puts back what the brakes raised).
 	 */
+	/** A force actuator made a velocity servo while a stiff speed loop drives
+	 *  it (ramms.mj.StiffDrive): its own gain, bias and limits, to put back. */
+	struct FStiffened
+	{
+		int32  GainType = 0;
+		double GainPrm[10] = {};
+		int32  BiasType = 0;
+		double BiasPrm[10] = {};
+		bool   ForceLimited = false;
+		double ForceRange[2] = {};
+		bool   CtrlLimited = false;
+		double CtrlRange[2] = {};
+	};
+
 	struct FDriveTable
 	{
 		FCriticalSection			 Lock;
 		TMap<FName, FPhysicsDrive>	 Drives;
 		TMap<FName, FPhysicsProfile> Profiles;
 		TMap<FName, FPhysicsBrake>	 Brakes;
-		AMjArticulation*			 Articulation = nullptr;
-		bool						 bAlive = true;
+		/** Actuator id -> what it was, for those made servos in StiffenedIn. */
+		TMap<int32, FStiffened> Stiffened;
+		const mjModel_*			StiffenedIn = nullptr;
+		AMjArticulation*		Articulation = nullptr;
+		bool					bAlive = true;
 		/** mjData::time at the last callback; negative before the first. */
 		double LastTime = -1.0;
 	};
@@ -208,6 +231,9 @@ private:
 	 *  paused. */
 	static void StepTable(FDriveTable& Table, mjModel_* Model, const mjData_* Data);
 	static void StepBrakes(FDriveTable& Table, mjModel_* Model);
-	static void StepDrives(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt);
+	static void StepDrives(FDriveTable& Table, mjModel_* Model, const mjData_* Data, double Dt);
+	/** Puts back every actuator StepDrives made a servo that is not in Keep
+	 *  (null: every one). */
+	static void RestoreStiffened(FDriveTable& Table, mjModel_* Model, const TSet<int32>* Keep);
 	static void StepProfiles(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt);
 };
