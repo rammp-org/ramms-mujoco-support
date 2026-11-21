@@ -447,7 +447,7 @@ void FRammsMujocoActuationBackend::ClearVelocityDrive(FName MotorId)
 	// What the loop staged last would otherwise go on acting until the motor
 	// is commanded again: its torque, or -- a stiff loop's -- a speed, which
 	// is a torque again once the actuator is put back as a plain motor (a
-	// braked wheel held its loop's last 50 N*m against the brake).
+	// braked wheel went on holding its loop's last torque against the brake).
 	if (bHad)
 	{
 		if (UMjNodeComponent* Actuator = ResolveActuator(MotorId))
@@ -880,8 +880,8 @@ void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, mjModel_* Mode
 	// servo for the step: force = Kd/g^2 (ctrl - g qvel), with ctrl the joint's
 	// target rate times its gear g plus the integral's share. The solver
 	// (implicitfast) takes the velocity term implicitly, so the damping can be
-	// as stiff as a geared drive: a lifted omni wheel's inertia (~0.03 kg*m^2)
-	// sets a ceiling of about 25 N*m per rad/s on a loop closed outside it.
+	// as stiff as a geared drive: a lifted wheel's small inertia caps the
+	// damping a loop closed outside the solver could use.
 	if (Table.StiffenedIn != Model)
 	{
 		RestoreStiffened(Table, Model, nullptr);
