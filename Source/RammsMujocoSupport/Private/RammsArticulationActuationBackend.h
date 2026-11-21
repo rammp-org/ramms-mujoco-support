@@ -84,6 +84,14 @@ public:
 	virtual bool   SimulatesMotorJoint(FName MotorId) const override { return Active().SimulatesMotorJoint(MotorId); }
 	virtual bool   HasMotorBrake(FName MotorId) const override { return Active().HasMotorBrake(MotorId); }
 	virtual bool   SetMotorBrake(FName MotorId, bool bEngaged) override { return Active().SetMotorBrake(MotorId, bEngaged); }
+	virtual bool   GetMotorEffort(FName MotorId, double WindowSeconds, FRammsMotorEffort& Out) const override
+	{
+		return Active().GetMotorEffort(MotorId, WindowSeconds, Out);
+	}
+	virtual bool SetMotorTorqueLimit(FName MotorId, float MinTorque, float MaxTorque) override
+	{
+		return Active().SetMotorTorqueLimit(MotorId, MinTorque, MaxTorque);
+	}
 
 private:
 	IRammsActuationBackend& Active() const;
