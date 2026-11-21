@@ -79,6 +79,16 @@ public:
 	 *  SetVelocityDrive releases the brake. */
 	virtual bool SetMotorBrake(FName MotorId, bool bEngaged) override;
 
+	/** The motor's actuator force (times its gear: the joint's sense) recorded
+	 *  every physics step from the first call on it, a trailing second or so
+	 *  kept; folded over WindowSeconds on the simulation's clock. */
+	virtual bool GetMotorEffort(FName MotorId, double WindowSeconds, FRammsMotorEffort& Out) const override;
+	/** A plain position servo's force range narrowed to [MinTorque,
+	 *  MaxTorque] (the joint's sense, within its own range) by the pre-step
+	 *  callback every physics step, and put back once cleared
+	 *  (ramms.mj.TorqueCaps). Not for a servo a stiff speed loop runs. */
+	virtual bool SetMotorTorqueLimit(FName MotorId, float MinTorque, float MaxTorque) override;
+
 	virtual ~FRammsMujocoActuationBackend() override;
 
 	/** The articulation a base component drives: its owner, else one attached under it (never one
@@ -184,6 +194,49 @@ private:
 	 *  compiled yet, not a plain force actuator on a hinge or slide). */
 	bool ResolveBrake(FName MotorId, UMjPhysicsEngine*& OutEngine, const mjModel_*& OutModel, int32& OutDofAdr, double& OutTorque) const;
 
+	/** A motor's compiled joint-transmission actuator: its engine, model and
+	 *  id. False before it is compiled, or for another transmission. */
+	bool ResolveJointActuator(FName MotorId, UMjPhysicsEngine*& OutEngine, const mjModel_*& OutModel, int32& OutActuatorId) const;
+
+	/** One physics step of a motor's actuator force (GetMotorEffort): the
+	 *  joint-sense force over the step just finished, how long the step was,
+	 *  and whether it sat at its applied lower (1) or upper (2) limit or at
+	 *  its own rating (4). */
+	struct FEffortSample
+	{
+		double Time = 0.0;
+		float  Force = 0.0f;
+		float  Dt = 0.0f;
+		uint8  Flags = 0;
+	};
+	static constexpr int32 EffortSamples = 1024;
+	struct FPhysicsEffort
+	{
+		int32				  ActuatorId = INDEX_NONE;
+		const mjModel_*		  Model = nullptr;
+		double				  Gear = 1.0;
+		TArray<FEffortSample> Ring; // EffortSamples long once watched
+		int32				  Head = 0;
+		int32				  Count = 0;
+	};
+
+	/** One servo's torque limit (SetMotorTorqueLimit), in actuator force:
+	 *  +-the largest double keeps the actuator's own limit on that side. */
+	struct FPhysicsCap
+	{
+		int32			ActuatorId = INDEX_NONE;
+		const mjModel_* Model = nullptr;
+		double			Lo = 0.0;
+		double			Hi = 0.0;
+		bool			bRemove = false;
+	};
+	/** A capped actuator's own force limits, to put back. */
+	struct FCappedRange
+	{
+		bool   ForceLimited = false;
+		double Range[2] = {};
+	};
+
 	/**
 	 * The loops, profiles and brakes, shared with the pre-step callback. The
 	 * callback outlives this backend -- URLab has no way to unregister one -- so
@@ -214,17 +267,24 @@ private:
 		/** Actuator id -> what it was, for those made servos in StiffenedIn. */
 		TMap<int32, FStiffened> Stiffened;
 		const mjModel_*			StiffenedIn = nullptr;
+		/** The actuator forces watched (GetMotorEffort), the torque limits
+		 *  (SetMotorTorqueLimit), and what each capped actuator's own limits
+		 *  were in CappedIn. */
+		TMap<FName, FPhysicsEffort> Efforts;
+		TMap<FName, FPhysicsCap>	Caps;
+		TMap<int32, FCappedRange>	CapOriginal;
+		const mjModel_*				CappedIn = nullptr;
 		AMjArticulation*		Articulation = nullptr;
 		bool					bAlive = true;
 		/** mjData::time at the last callback; negative before the first. */
 		double LastTime = -1.0;
 	};
-	TSharedPtr<FDriveTable, ESPMode::ThreadSafe> DriveTable;
-	bool										 bDriveCallbackRegistered = false;
+	mutable TSharedPtr<FDriveTable, ESPMode::ThreadSafe> DriveTable;
+	mutable bool										 bDriveCallbackRegistered = false;
 
 	/** The table, made on first use, and the callback that steps it registered
-	 *  with Engine. */
-	FDriveTable& EnsureDriveTable(UMjPhysicsEngine& Engine);
+	 *  with Engine (const: a read of the efforts starts their recording). */
+	FDriveTable& EnsureDriveTable(UMjPhysicsEngine& Engine) const;
 
 	/** One physics step of every loop, profile and brake; physics thread,
 	 *  under CallbackMutex. Time is the simulation's: no step while it is
@@ -236,4 +296,9 @@ private:
 	 *  (null: every one). */
 	static void RestoreStiffened(FDriveTable& Table, mjModel_* Model, const TSet<int32>* Keep);
 	static void StepProfiles(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt);
+	/** Records each watched actuator's force over the step just finished. */
+	static void StepEfforts(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt);
+	/** Narrows each capped servo's force range, and puts back the ones
+	 *  cleared (also on a dead table). */
+	static void StepCaps(FDriveTable& Table, mjModel_* Model);
 };

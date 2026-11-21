@@ -40,6 +40,11 @@ static TAutoConsoleVariable<int32> CVarRammsMjServoFeedForward(TEXT("ramms.mj.Se
 				TEXT("feedforward -- at the same stiffness. 1 (the default): on; 0: the setpoint alone."),
 	ECVF_Default);
 
+static TAutoConsoleVariable<int32> CVarRammsMjTorqueCaps(TEXT("ramms.mj.TorqueCaps"), 1,
+	TEXT("A plain position servo's torque limit (SetMotorTorqueLimit: a drive's per-direction limit, narrowing its force range "
+		 "every physics step): 1 (the default) applied; 0 refused, and every limit in force put back."),
+	ECVF_Default);
+
 bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
 {
 	Articulation = nullptr;
@@ -322,11 +327,17 @@ FRammsMujocoActuationBackend::~FRammsMujocoActuationBackend()
 		DriveTable->Drives.Reset();
 		DriveTable->Profiles.Reset();
 		DriveTable->Articulation = nullptr;
-		// Kept for the callback to put back the friction they raised.
+		// Kept for the callback to put back the friction they raised, and the
+		// force ranges the torque limits narrowed.
 		for (TPair<FName, FPhysicsBrake>& Pair : DriveTable->Brakes)
 		{
 			Pair.Value.bEngaged = false;
 		}
+		for (TPair<FName, FPhysicsCap>& Pair : DriveTable->Caps)
+		{
+			Pair.Value.bRemove = true;
+		}
+		DriveTable->Efforts.Reset();
 	}
 }
 
@@ -654,7 +665,7 @@ bool FRammsMujocoActuationBackend::SetMotorBrake(FName MotorId, bool bEngaged)
 	return true;
 }
 
-FRammsMujocoActuationBackend::FDriveTable& FRammsMujocoActuationBackend::EnsureDriveTable(UMjPhysicsEngine& Engine)
+FRammsMujocoActuationBackend::FDriveTable& FRammsMujocoActuationBackend::EnsureDriveTable(UMjPhysicsEngine& Engine) const
 {
 	if (!DriveTable)
 	{
@@ -676,19 +687,12 @@ void FRammsMujocoActuationBackend::StepTable(FDriveTable& Table, mjModel_* Model
 	{
 		return;
 	}
-	// First, and on a dead table too: it still puts back what it raised (and
-	// what the stiff loops made servos).
-	StepBrakes(Table, Model);
-	if (!Table.bAlive || !Table.Articulation)
-	{
-		RestoreStiffened(Table, Model, nullptr);
-		return;
-	}
 	// The time since the last callback, on the simulation's own clock: none
 	// while it is paused (the callbacks still run then, and a loop integrating
 	// a fixed timestep would wind up) and the whole batch when one request
 	// steps several. A clock gone back is a reset: the robot is back at its
-	// start, so every loop and profile starts over.
+	// start, so every loop and profile starts over, and the efforts recorded
+	// before it go.
 	const double Now = Data->time;
 	double		 Dt = 0.0;
 	if (Table.LastTime >= 0.0 && Now < Table.LastTime)
@@ -701,12 +705,32 @@ void FRammsMujocoActuationBackend::StepTable(FDriveTable& Table, mjModel_* Model
 		{
 			Pair.Value.bStarted = false;
 		}
+		for (TPair<FName, FPhysicsEffort>& Pair : Table.Efforts)
+		{
+			Pair.Value.Count = 0;
+			Pair.Value.Head = 0;
+		}
 	}
 	else if (Table.LastTime >= 0.0)
 	{
 		Dt = Now - Table.LastTime;
 	}
 	Table.LastTime = Now;
+	// The forces of the step just finished, before the torque limits change
+	// the ranges: a sample's limits are those its step ran under.
+	if (Table.bAlive && Dt > 0.0)
+	{
+		StepEfforts(Table, Model, Data, Dt);
+	}
+	// Then, on a dead table too: they still put back what they raised and
+	// narrowed (and what the stiff loops made servos).
+	StepBrakes(Table, Model);
+	StepCaps(Table, Model);
+	if (!Table.bAlive || !Table.Articulation)
+	{
+		RestoreStiffened(Table, Model, nullptr);
+		return;
+	}
 	StepDrives(Table, Model, Data, Dt);
 	StepProfiles(Table, Model, Data, Dt);
 }
@@ -1012,4 +1036,305 @@ double FRammsMujocoActuationBackend::GetSimulationTime() const
 		}
 	});
 	return Time;
+}
+
+bool FRammsMujocoActuationBackend::ResolveJointActuator(FName MotorId, UMjPhysicsEngine*& OutEngine, const mjModel_*& OutModel,
+	int32& OutActuatorId) const
+{
+	UMjNodeComponent* Actuator = ResolveActuator(MotorId);
+	if (!Actuator || !Articulation.IsValid())
+	{
+		return false;
+	}
+	const TOptional<int32>& Bound = Actuator->GetBoundId();
+	UMjPhysicsEngine*		Engine = AAMjManager::ResolveEngine(Actuator);
+	const mjModel*			Model = Engine ? Engine->GetModel() : nullptr;
+	if (!Bound.IsSet() || !Model)
+	{
+		return false;
+	}
+	const int32 Id = Bound.GetValue();
+	if (Id < 0 || Id >= Model->nu || Model->actuator_trntype[Id] != mjTRN_JOINT)
+	{
+		return false;
+	}
+	OutEngine = Engine;
+	OutModel = Model;
+	OutActuatorId = Id;
+	return true;
+}
+
+namespace
+{
+	/** An actuator's force range in its joint's sense (x its gear, the ends
+	 *  in order); unbounded where it has none. */
+	void JointForceRange(bool bLimited, double Lo, double Hi, double Gear, double& OutLo, double& OutHi)
+	{
+		if (!bLimited)
+		{
+			OutLo = -TNumericLimits<double>::Max();
+			OutHi = TNumericLimits<double>::Max();
+			return;
+		}
+		OutLo = Lo * Gear;
+		OutHi = Hi * Gear;
+		if (OutLo > OutHi)
+		{
+			Swap(OutLo, OutHi);
+		}
+	}
+
+	/** Within the at-limit tolerance (0.5%) of a range's end. */
+	bool AtLower(double F, double Lo)
+	{
+		return F <= Lo + 0.005 * FMath::Abs(Lo) + 1e-9;
+	}
+	bool AtUpper(double F, double Hi)
+	{
+		return F >= Hi - 0.005 * FMath::Abs(Hi) - 1e-9;
+	}
+} // namespace
+
+bool FRammsMujocoActuationBackend::GetMotorEffort(FName MotorId, double WindowSeconds, FRammsMotorEffort& Out) const
+{
+	UMjPhysicsEngine* Engine = nullptr;
+	const mjModel*	  Model = nullptr;
+	int32			  Id = INDEX_NONE;
+	if (!ResolveJointActuator(MotorId, Engine, Model, Id))
+	{
+		return false;
+	}
+	FDriveTable&	Table = EnsureDriveTable(*Engine);
+	FScopeLock		Lock(&Table.Lock);
+	FPhysicsEffort& E = Table.Efforts.FindOrAdd(MotorId);
+	if (E.ActuatorId != Id || E.Model != Model || E.Ring.Num() != EffortSamples)
+	{
+		// The first read (or one after a recompile) starts the recording.
+		E.ActuatorId = Id;
+		E.Model = Model;
+		E.Gear = Model->actuator_gear[6 * Id];
+		E.Ring.SetNumZeroed(EffortSamples);
+		E.Head = 0;
+		E.Count = 0;
+		return false;
+	}
+	if (E.Count == 0)
+	{
+		return false;
+	}
+	Out = FRammsMotorEffort();
+	const FEffortSample& Last = E.Ring[(E.Head - 1 + EffortSamples) % EffortSamples];
+	Out.LastNm = Last.Force;
+	Out.PeakNm = Last.Force;
+	Out.LatestTime = Last.Time;
+	// Back from the last sample over the window (at least the last one).
+	double Weighted = 0.0;
+	for (int32 k = 0; k < E.Count; ++k)
+	{
+		const FEffortSample& Sample = E.Ring[(E.Head - 1 - k + 2 * EffortSamples) % EffortSamples];
+		if (k > 0 && Sample.Time <= Last.Time - WindowSeconds)
+		{
+			break;
+		}
+		Weighted += static_cast<double>(Sample.Force) * Sample.Dt;
+		Out.Seconds += Sample.Dt;
+		Out.AtLowerSeconds += (Sample.Flags & 1) ? Sample.Dt : 0.0;
+		Out.AtUpperSeconds += (Sample.Flags & 2) ? Sample.Dt : 0.0;
+		Out.AtRatedSeconds += (Sample.Flags & 4) ? Sample.Dt : 0.0;
+		if (FMath::Abs(Sample.Force) > FMath::Abs(Out.PeakNm))
+		{
+			Out.PeakNm = Sample.Force;
+		}
+	}
+	Out.MeanNm = Out.Seconds > 0.0 ? Weighted / Out.Seconds : Last.Force;
+	// The limits as they stand: applied now, and the actuator's own.
+	JointForceRange(Model->actuator_forcelimited[Id] != 0, Model->actuator_forcerange[2 * Id], Model->actuator_forcerange[2 * Id + 1],
+		E.Gear, Out.LowerNm, Out.UpperNm);
+	if (const FCappedRange* Own = Table.CappedIn == Model ? Table.CapOriginal.Find(Id) : nullptr)
+	{
+		JointForceRange(Own->ForceLimited, Own->Range[0], Own->Range[1], E.Gear, Out.RatedLowerNm, Out.RatedUpperNm);
+	}
+	else
+	{
+		Out.RatedLowerNm = Out.LowerNm;
+		Out.RatedUpperNm = Out.UpperNm;
+	}
+	return true;
+}
+
+bool FRammsMujocoActuationBackend::SetMotorTorqueLimit(FName MotorId, float MinTorque, float MaxTorque)
+{
+	if (!(MinTorque < MaxTorque))
+	{
+		// Cleared: the callback puts the actuator's own range back.
+		if (DriveTable)
+		{
+			FScopeLock Lock(&DriveTable->Lock);
+			if (FPhysicsCap* Cap = DriveTable->Caps.Find(MotorId))
+			{
+				Cap->bRemove = true;
+			}
+		}
+		return true;
+	}
+	if (CVarRammsMjTorqueCaps.GetValueOnAnyThread() == 0)
+	{
+		if (DriveTable)
+		{
+			FScopeLock Lock(&DriveTable->Lock);
+			for (TPair<FName, FPhysicsCap>& Pair : DriveTable->Caps)
+			{
+				Pair.Value.bRemove = true;
+			}
+		}
+		return false;
+	}
+	UMjPhysicsEngine* Engine = nullptr;
+	const mjModel*	  Model = nullptr;
+	int32			  Id = INDEX_NONE;
+	if (!ResolveJointActuator(MotorId, Engine, Model, Id))
+	{
+		return false;
+	}
+	// A plain position servo only: fixed gain, affine bias of -kp and -kv, no
+	// activation dynamics.
+	const mjtNum Kp = Model->actuator_gainprm[Id * mjNGAIN];
+	if (Model->actuator_gaintype[Id] != mjGAIN_FIXED || Model->actuator_biastype[Id] != mjBIAS_AFFINE
+		|| Model->actuator_dyntype[Id] != mjDYN_NONE || !(Kp > 0.0)
+		|| !FMath::IsNearlyEqual(Model->actuator_biasprm[Id * mjNBIAS + 1], -Kp, 1e-6 * Kp))
+	{
+		return false;
+	}
+	const double Gear = Model->actuator_gear[6 * Id];
+	if (FMath::Abs(Gear) < 1e-12)
+	{
+		return false;
+	}
+	FDriveTable& Table = EnsureDriveTable(*Engine);
+	FScopeLock	 Lock(&Table.Lock);
+	if (Table.Stiffened.Contains(Id))
+	{
+		return false; // a stiff speed loop runs it
+	}
+	// The joint's sense to the actuator's force (divided by the gear; a
+	// negative gear swaps the ends); a side at the largest float keeps the
+	// actuator's own limit there.
+	constexpr double Keep = TNumericLimits<double>::Max();
+	const bool		 bKeepLo = MinTorque <= -0.5f * TNumericLimits<float>::Max();
+	const bool		 bKeepHi = MaxTorque >= 0.5f * TNumericLimits<float>::Max();
+	double			 Lo = bKeepLo ? -Keep : MinTorque / Gear;
+	double			 Hi = bKeepHi ? Keep : MaxTorque / Gear;
+	if (Gear < 0.0)
+	{
+		Lo = bKeepHi ? -Keep : MaxTorque / Gear;
+		Hi = bKeepLo ? Keep : MinTorque / Gear;
+	}
+	Table.Articulation = Articulation.Get();
+	FPhysicsCap& Cap = Table.Caps.FindOrAdd(MotorId);
+	Cap.ActuatorId = Id;
+	Cap.Model = Model;
+	Cap.Lo = Lo;
+	Cap.Hi = Hi;
+	Cap.bRemove = false;
+	return true;
+}
+
+void FRammsMujocoActuationBackend::StepEfforts(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt)
+{
+	for (TPair<FName, FPhysicsEffort>& Pair : Table.Efforts)
+	{
+		FPhysicsEffort& E = Pair.Value;
+		const int32		Id = E.ActuatorId;
+		if (E.Model != Model || Id < 0 || Id >= Model->nu || E.Ring.Num() != EffortSamples)
+		{
+			continue;
+		}
+		// actuator_force before this step is the force of the step just
+		// finished, under the range that step ran with.
+		const double F = Data->actuator_force[Id];
+		uint8		 Flags = 0;
+		if (Model->actuator_forcelimited[Id])
+		{
+			Flags |= AtLower(F, Model->actuator_forcerange[2 * Id]) ? 1 : 0;
+			Flags |= AtUpper(F, Model->actuator_forcerange[2 * Id + 1]) ? 2 : 0;
+		}
+		// At its own rating, on the side it pushed: its saved range if capped.
+		bool				Rated = Model->actuator_forcelimited[Id] != 0;
+		double				RatedLo = Model->actuator_forcerange[2 * Id], RatedHi = Model->actuator_forcerange[2 * Id + 1];
+		const FCappedRange* Own = Table.CappedIn == Model ? Table.CapOriginal.Find(Id) : nullptr;
+		if (Own)
+		{
+			Rated = Own->ForceLimited;
+			RatedLo = Own->Range[0];
+			RatedHi = Own->Range[1];
+		}
+		if (Rated && ((F < 0.0 && AtLower(F, RatedLo)) || (F > 0.0 && AtUpper(F, RatedHi))))
+		{
+			Flags |= 4;
+		}
+		if (E.Gear < 0.0)
+		{
+			// The joint's sense: the ends trade places.
+			Flags = static_cast<uint8>((Flags & 4) | ((Flags & 1) << 1) | ((Flags & 2) >> 1));
+		}
+		FEffortSample& Sample = E.Ring[E.Head];
+		Sample.Time = Data->time;
+		Sample.Force = static_cast<float>(F * E.Gear);
+		Sample.Dt = static_cast<float>(Dt);
+		Sample.Flags = Flags;
+		E.Head = (E.Head + 1) % EffortSamples;
+		E.Count = FMath::Min(E.Count + 1, EffortSamples);
+	}
+}
+
+void FRammsMujocoActuationBackend::StepCaps(FDriveTable& Table, mjModel_* Model)
+{
+	if (Table.CappedIn != Model)
+	{
+		// A model since recompiled has its own ranges: nothing to put back.
+		Table.CapOriginal.Reset();
+		Table.CappedIn = Model;
+	}
+	for (auto It = Table.Caps.CreateIterator(); It; ++It)
+	{
+		FPhysicsCap& Cap = It.Value();
+		const int32	 Id = Cap.ActuatorId;
+		const bool	 bValid = Cap.Model == Model && Id >= 0 && Id < Model->nu;
+		const bool	 bLive = Table.bAlive && !Cap.bRemove && bValid;
+		if (bLive)
+		{
+			if (!Table.CapOriginal.Contains(Id))
+			{
+				FCappedRange& Own = Table.CapOriginal.Add(Id);
+				Own.ForceLimited = Model->actuator_forcelimited[Id] != 0;
+				Own.Range[0] = Model->actuator_forcerange[2 * Id];
+				Own.Range[1] = Model->actuator_forcerange[2 * Id + 1];
+			}
+			const FCappedRange& Own = Table.CapOriginal[Id];
+			const double		AuthLo = Own.ForceLimited ? Own.Range[0] : -1e9;
+			const double		AuthHi = Own.ForceLimited ? Own.Range[1] : 1e9;
+			// Within its own range, and never across zero: a limit bounds a push,
+			// it does not command one.
+			const double Lo = FMath::Min(FMath::Max(AuthLo, Cap.Lo), 0.0);
+			const double Hi = FMath::Max(FMath::Min(AuthHi, Cap.Hi), 0.0);
+			Model->actuator_forcelimited[Id] = 1;
+			Model->actuator_forcerange[2 * Id] = Lo;
+			Model->actuator_forcerange[2 * Id + 1] = Hi;
+			continue;
+		}
+		if (bValid)
+		{
+			if (const FCappedRange* Own = Table.CapOriginal.Find(Id))
+			{
+				Model->actuator_forcelimited[Id] = Own->ForceLimited ? 1 : 0;
+				Model->actuator_forcerange[2 * Id] = Own->Range[0];
+				Model->actuator_forcerange[2 * Id + 1] = Own->Range[1];
+				Table.CapOriginal.Remove(Id);
+			}
+		}
+		if (Cap.bRemove || !Table.bAlive || !bValid)
+		{
+			It.RemoveCurrent();
+		}
+	}
 }
