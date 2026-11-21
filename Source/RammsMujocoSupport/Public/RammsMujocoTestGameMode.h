@@ -69,6 +69,14 @@ public:
 	/** Stop URLab's UMjInputHandler ticking (its hotkeys collide with robot keys). */
 	void DisableUrlabHotkeys(AAMjManager* Manager);
 
+protected:
+	/** Where the default pawn is pre-spawned: the first PlayerStart (scale 1),
+	 *  else the world origin. */
+	virtual FTransform GetPreSpawnTransform() const;
+
+	/** The pawn InitGame pre-spawned, until a player takes it. */
+	APawn* GetPreSpawnedPawn() const { return PreSpawnedPawn; }
+
 private:
 	void TryStartSimulation();
 
