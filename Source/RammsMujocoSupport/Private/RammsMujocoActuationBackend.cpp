@@ -42,7 +42,7 @@ static TAutoConsoleVariable<int32> CVarRammsMjServoFeedForward(TEXT("ramms.mj.Se
 
 static TAutoConsoleVariable<int32> CVarRammsMjTorqueCaps(TEXT("ramms.mj.TorqueCaps"), 1,
 	TEXT("A plain position servo's torque limit (SetMotorTorqueLimit: a drive's per-direction limit, narrowing its force range "
-		 "every physics step): 1 (the default) applied; 0 refused, and every limit in force put back."),
+		 "every physics step): 1 (the default) applied; 0 refused, and every limit in force put back from the next physics step."),
 	ECVF_Default);
 
 bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
@@ -918,8 +918,8 @@ void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, mjModel_* Mode
 			Stiff.Add(Id);
 			// The torque range: the loop's (the motor's own), else the force
 			// the plain motor could put out (its gain of 1 times its ctrlrange).
-			const FStiffened& Was = Table.Stiffened[Id];
-			double			  Lo = Drive.Lo, Hi = Drive.Hi;
+			FStiffened& Was = Table.Stiffened[Id];
+			double		Lo = Drive.Lo, Hi = Drive.Hi;
 			if (!(Lo < Hi))
 			{
 				Lo = Was.CtrlLimited ? Was.CtrlRange[0] * Was.GainPrm[0] : -1e9;
@@ -929,6 +929,10 @@ void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, mjModel_* Mode
 					Swap(Lo, Hi);
 				}
 			}
+			// (For the efforts: the motor's rating while the loop has it.)
+			Was.bLoopRange = Lo > -1e8 || Hi < 1e8;
+			Was.LoopRange[0] = Lo;
+			Was.LoopRange[1] = Hi;
 			const double StiffKd = FMath::Max(1.0, Drive.StiffKd);
 			const double StiffKi = FMath::Max(0.0, Drive.StiffKi);
 			const double KdA = StiffKd / (Gear * Gear);
@@ -1148,17 +1152,12 @@ bool FRammsMujocoActuationBackend::GetMotorEffort(FName MotorId, double WindowSe
 	}
 	Out.MeanNm = Out.Seconds > 0.0 ? Weighted / Out.Seconds : Last.Force;
 	// The limits as they stand: applied now, and the actuator's own.
-	JointForceRange(Model->actuator_forcelimited[Id] != 0, Model->actuator_forcerange[2 * Id], Model->actuator_forcerange[2 * Id + 1],
-		E.Gear, Out.LowerNm, Out.UpperNm);
-	if (const FCappedRange* Own = Table.CappedIn == Model ? Table.CapOriginal.Find(Id) : nullptr)
-	{
-		JointForceRange(Own->ForceLimited, Own->Range[0], Own->Range[1], E.Gear, Out.RatedLowerNm, Out.RatedUpperNm);
-	}
-	else
-	{
-		Out.RatedLowerNm = Out.LowerNm;
-		Out.RatedUpperNm = Out.UpperNm;
-	}
+	bool   bLimited = false, bRated = false;
+	double Lo = 0.0, Hi = 0.0, RatedLo = 0.0, RatedHi = 0.0;
+	ForceLimitsOf(Table, Model, Id, /*bRated=*/false, bLimited, Lo, Hi);
+	ForceLimitsOf(Table, Model, Id, /*bRated=*/true, bRated, RatedLo, RatedHi);
+	JointForceRange(bLimited, Lo, Hi, E.Gear, Out.LowerNm, Out.UpperNm);
+	JointForceRange(bRated, RatedLo, RatedHi, E.Gear, Out.RatedLowerNm, Out.RatedUpperNm);
 	return true;
 }
 
@@ -1239,6 +1238,37 @@ bool FRammsMujocoActuationBackend::SetMotorTorqueLimit(FName MotorId, float MinT
 	return true;
 }
 
+void FRammsMujocoActuationBackend::ForceLimitsOf(const FDriveTable& Table, const mjModel_* Model, int32 Id, bool bRated, bool& bOutLimited,
+	double& OutLo, double& OutHi)
+{
+	// A stiff speed loop's actuator: its loop's range, whichever form (servo,
+	// plain motor) the loop left it in. It is never capped (SetMotorTorqueLimit
+	// refuses it).
+	if (const FStiffened* Was = Table.StiffenedIn == Model ? Table.Stiffened.Find(Id) : nullptr)
+	{
+		if (Was->bLoopRange)
+		{
+			bOutLimited = true;
+			OutLo = Was->LoopRange[0];
+			OutHi = Was->LoopRange[1];
+			return;
+		}
+	}
+	if (bRated)
+	{
+		if (const FCappedRange* Own = Table.CappedIn == Model ? Table.CapOriginal.Find(Id) : nullptr)
+		{
+			bOutLimited = Own->ForceLimited;
+			OutLo = Own->Range[0];
+			OutHi = Own->Range[1];
+			return;
+		}
+	}
+	bOutLimited = Model->actuator_forcelimited[Id] != 0;
+	OutLo = Model->actuator_forcerange[2 * Id];
+	OutHi = Model->actuator_forcerange[2 * Id + 1];
+}
+
 void FRammsMujocoActuationBackend::StepEfforts(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt)
 {
 	for (TPair<FName, FPhysicsEffort>& Pair : Table.Efforts)
@@ -1253,21 +1283,18 @@ void FRammsMujocoActuationBackend::StepEfforts(FDriveTable& Table, const mjModel
 		// finished, under the range that step ran with.
 		const double F = Data->actuator_force[Id];
 		uint8		 Flags = 0;
-		if (Model->actuator_forcelimited[Id])
+		bool		 bLimited = false;
+		double		 Lo = 0.0, Hi = 0.0;
+		ForceLimitsOf(Table, Model, Id, /*bRated=*/false, bLimited, Lo, Hi);
+		if (bLimited)
 		{
-			Flags |= AtLower(F, Model->actuator_forcerange[2 * Id]) ? 1 : 0;
-			Flags |= AtUpper(F, Model->actuator_forcerange[2 * Id + 1]) ? 2 : 0;
+			Flags |= AtLower(F, Lo) ? 1 : 0;
+			Flags |= AtUpper(F, Hi) ? 2 : 0;
 		}
-		// At its own rating, on the side it pushed: its saved range if capped.
-		bool				Rated = Model->actuator_forcelimited[Id] != 0;
-		double				RatedLo = Model->actuator_forcerange[2 * Id], RatedHi = Model->actuator_forcerange[2 * Id + 1];
-		const FCappedRange* Own = Table.CappedIn == Model ? Table.CapOriginal.Find(Id) : nullptr;
-		if (Own)
-		{
-			Rated = Own->ForceLimited;
-			RatedLo = Own->Range[0];
-			RatedHi = Own->Range[1];
-		}
+		// At its own rating, on the side it pushed.
+		bool   Rated = false;
+		double RatedLo = 0.0, RatedHi = 0.0;
+		ForceLimitsOf(Table, Model, Id, /*bRated=*/true, Rated, RatedLo, RatedHi);
 		if (Rated && ((F < 0.0 && AtLower(F, RatedLo)) || (F > 0.0 && AtUpper(F, RatedHi))))
 		{
 			Flags |= 4;
@@ -1295,12 +1322,15 @@ void FRammsMujocoActuationBackend::StepCaps(FDriveTable& Table, mjModel_* Model)
 		Table.CapOriginal.Reset();
 		Table.CappedIn = Model;
 	}
+	// ramms.mj.TorqueCaps 0: every limit in force put back from the next step
+	// (kept, to come back with the setting).
+	const bool bCapsOn = CVarRammsMjTorqueCaps.GetValueOnAnyThread() != 0;
 	for (auto It = Table.Caps.CreateIterator(); It; ++It)
 	{
 		FPhysicsCap& Cap = It.Value();
 		const int32	 Id = Cap.ActuatorId;
 		const bool	 bValid = Cap.Model == Model && Id >= 0 && Id < Model->nu;
-		const bool	 bLive = Table.bAlive && !Cap.bRemove && bValid;
+		const bool	 bLive = bCapsOn && Table.bAlive && !Cap.bRemove && bValid;
 		if (bLive)
 		{
 			if (!Table.CapOriginal.Contains(Id))

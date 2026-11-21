@@ -256,6 +256,11 @@ private:
 		double ForceRange[2] = {};
 		bool   CtrlLimited = false;
 		double CtrlRange[2] = {};
+		/** The torque range the loop runs the actuator to (its force, set every
+		 *  step it runs): the motor's rating while the loop has it -- the model's
+		 *  own range then flips between the loop's and the plain motor's. */
+		bool   bLoopRange = false;
+		double LoopRange[2] = {};
 	};
 
 	struct FDriveTable
@@ -274,8 +279,8 @@ private:
 		TMap<FName, FPhysicsCap>	Caps;
 		TMap<int32, FCappedRange>	CapOriginal;
 		const mjModel_*				CappedIn = nullptr;
-		AMjArticulation*		Articulation = nullptr;
-		bool					bAlive = true;
+		AMjArticulation*			Articulation = nullptr;
+		bool						bAlive = true;
 		/** mjData::time at the last callback; negative before the first. */
 		double LastTime = -1.0;
 	};
@@ -298,6 +303,11 @@ private:
 	static void StepProfiles(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt);
 	/** Records each watched actuator's force over the step just finished. */
 	static void StepEfforts(FDriveTable& Table, const mjModel_* Model, const mjData_* Data, double Dt);
+	/** Actuator Id's force limits in Model (its force; bLimited false:
+	 *  none): those in force now (bRated false), or its own rating -- a
+	 *  stiff speed loop's range while one runs it, a capped actuator's saved
+	 *  range, else the model's. */
+	static void ForceLimitsOf(const FDriveTable& Table, const mjModel_* Model, int32 Id, bool bRated, bool& bOutLimited, double& OutLo, double& OutHi);
 	/** Narrows each capped servo's force range, and puts back the ones
 	 *  cleared (also on a dead table). */
 	static void StepCaps(FDriveTable& Table, mjModel_* Model);
