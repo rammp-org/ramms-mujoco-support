@@ -28,10 +28,19 @@ void ARammsMujocoTestGameMode::InitGame(const FString& MapName, const FString& O
 		return;
 	}
 
-	const FTransform	  SpawnTransform = GetPreSpawnTransform();
-	FActorSpawnParameters Params;
-	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	PreSpawnedPawn = GetWorld()->SpawnActor<APawn>(DefaultPawnClass, SpawnTransform, Params);
+	const FTransform SpawnTransform = GetPreSpawnTransform();
+	// Deferred, so that it can be kept from AI possession first: a pawn spawned
+	// now counts as placed in the world, and one placed in the world that no
+	// player auto-receives (a plain pawn class's defaults) gets an AI controller
+	// as it initialises. SpawnDefaultPawnAtTransform would then find it taken
+	// and spawn a second one for the player.
+	PreSpawnedPawn = GetWorld()->SpawnActorDeferred<APawn>(DefaultPawnClass, SpawnTransform, nullptr, nullptr,
+		ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+	if (PreSpawnedPawn)
+	{
+		PreSpawnedPawn->AutoPossessAI = EAutoPossessAI::Disabled;
+		PreSpawnedPawn->FinishSpawning(SpawnTransform);
+	}
 	UE_LOG(LogTemp, Log, TEXT("[MujocoTestGameMode] pre-spawned default pawn %s (%s) at %s so the MuJoCo scene compiles with it."),
 		PreSpawnedPawn ? *PreSpawnedPawn->GetName() : TEXT("<failed>"), *DefaultPawnClass->GetName(),
 		*SpawnTransform.GetLocation().ToString());
