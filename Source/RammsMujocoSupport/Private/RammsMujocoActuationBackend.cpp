@@ -33,11 +33,11 @@ static TAutoConsoleVariable<float>	 CVarRammsMjStiffDriveIntegral(TEXT("ramms.mj
 		  TEXT("integral cap (FRammsVelocityGains::MaxIntegralTorque)."),
 	  ECVF_Default);
 
-static TAutoConsoleVariable<int32> CVarRammsMjServoFeedForward(TEXT("ramms.mj.ServoFeedForward"), 0,
+static TAutoConsoleVariable<int32> CVarRammsMjServoFeedForward(TEXT("ramms.mj.ServoFeedForward"), 1,
 	TEXT("A position servo following a physics-rate profile (SetPositionProfile) is also given its setpoint's rate: its ")
 		TEXT("command is the setpoint led by kv / kp of that rate, so the PD's damping acts on the speed error rather than the ")
 			TEXT("speed and the servo follows a moving setpoint without its velocity lag -- a real servo drive's velocity ")
-				TEXT("feedforward -- at the same stiffness. 1: on; 0 (the default): the setpoint alone."),
+				TEXT("feedforward -- at the same stiffness. 1 (the default): on; 0: the setpoint alone."),
 	ECVF_Default);
 
 bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
