@@ -33,6 +33,13 @@ static TAutoConsoleVariable<float>	 CVarRammsMjStiffDriveIntegral(TEXT("ramms.mj
 		  TEXT("integral cap (FRammsVelocityGains::MaxIntegralTorque)."),
 	  ECVF_Default);
 
+static TAutoConsoleVariable<int32> CVarRammsMjServoFeedForward(TEXT("ramms.mj.ServoFeedForward"), 0,
+	TEXT("A position servo following a physics-rate profile (SetPositionProfile) is also given its setpoint's rate: its ")
+		TEXT("command is the setpoint led by kv / kp of that rate, so the PD's damping acts on the speed error rather than the ")
+			TEXT("speed and the servo follows a moving setpoint without its velocity lag -- a real servo drive's velocity ")
+				TEXT("feedforward -- at the same stiffness. 1: on; 0 (the default): the setpoint alone."),
+	ECVF_Default);
+
 bool FRammsMujocoActuationBackend::Initialize(URammsRobotBaseComponent& Base)
 {
 	Articulation = nullptr;
@@ -790,7 +797,23 @@ void FRammsMujocoActuationBackend::StepProfiles(FDriveTable& Table, const mjMode
 		{
 			Setpoint = FMath::Clamp(Setpoint, Profile.Lo, Profile.Hi);
 		}
-		Table.Articulation->StageInternalControl(Profile.ActuatorId, Setpoint * Profile.CtrlPerUnit);
+		// The setpoint's rate fed forward (ramms.mj.ServoFeedForward): a position
+		// servo's force is kp (ctrl - q) - kv qdot, so a command led by kv / kp of
+		// the setpoint's rate makes it kp (s - q) + kv (sdot - qdot) -- no lag
+		// behind a setpoint moving steadily, the stiffness unchanged. (Only for a
+		// plain position servo: fixed gain, affine bias of -kp and -kv.)
+		double Command = Setpoint;
+		if (CVarRammsMjServoFeedForward.GetValueOnAnyThread() != 0 && Model->actuator_gaintype[Profile.ActuatorId] == mjGAIN_FIXED
+			&& Model->actuator_biastype[Profile.ActuatorId] == mjBIAS_AFFINE)
+		{
+			const mjtNum Kp = Model->actuator_gainprm[Profile.ActuatorId * mjNGAIN];
+			const mjtNum Kv = -Model->actuator_biasprm[Profile.ActuatorId * mjNBIAS + 2];
+			if (Kp > 0.0 && Kv > 0.0 && FMath::IsNearlyEqual(Model->actuator_biasprm[Profile.ActuatorId * mjNBIAS + 1], -Kp, 1e-6 * Kp))
+			{
+				Command += Kv / Kp * Profile.Follower.Rate;
+			}
+		}
+		Table.Articulation->StageInternalControl(Profile.ActuatorId, Command * Profile.CtrlPerUnit);
 	}
 }
 
