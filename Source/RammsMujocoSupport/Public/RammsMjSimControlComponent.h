@@ -20,6 +20,11 @@ class AAMjManager;
  *   sim.debug.contacts / visuals / collisions / joints /
  *   quick_convert_collisions / shader_mode / tendons       — group "Sim Debug"
  *   sim.running                                            — readback (1 = running)
+ *   sim.frame_lock   Off / Matched / 1/16 s                — group "Sim": URLab's frame-locked
+ *                    stepping (urlab.LockedFrameSeconds 0 / -1 / 0.0625), read back from the variable;
+ *                    any fixed period set elsewhere reads as the fixed choice, which then keeps it
+ *   sim.frame_lock.state                                   — Text: what is set, in words (the period
+ *                    and its steps per frame)   (both offered only with a URLab that has the variable)
  *
  * Add one to any robot actor in a MuJoCo scene; it finds the AMjManager.
  */
@@ -61,5 +66,7 @@ public:
 	virtual bool  ApplyControl(FName Id, float Value) override;
 	virtual bool  TriggerControl(FName Id) override;
 	virtual bool  ReadControl(FName Id, float& OutValue) const override;
+	virtual bool  ReadTarget(FName Id, float& OutTarget) const override;
+	virtual bool  ReadControlText(FName Id, FText& OutText) const override;
 	virtual int32 GetControlOrder() const override { return 200; }
 };
