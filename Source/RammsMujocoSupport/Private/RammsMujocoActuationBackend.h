@@ -135,6 +135,10 @@ private:
 		int32  DofAdr = INDEX_NONE;
 		double Scale = 1.0; // robot units per qvel unit (100 for a slide joint)
 		double Target = 0.0;
+		/** Simulated seconds since the game thread last gave Target
+		 *  (SetVelocityDrive): the physics thread counts it up every step and
+		 *  drives to rest once the command is stale. */
+		double SinceCommand = 0.0;
 		double Kp = 0.0;
 		double Ki = 0.0;
 		double MaxIntegral = 0.0;
@@ -179,6 +183,10 @@ private:
 		/** The model DofAdr indexes; the brake holds only in that one. */
 		const mjModel_* Model = nullptr;
 		int32			DofAdr = INDEX_NONE;
+		/** The braked joint's name in the compiled model (empty: it has none):
+		 *  the physics thread finds the joint again by it after a recompile,
+		 *  which can move the dof. */
+		FString			JointName;
 		double			Torque = 0.0;
 		bool			bEngaged = false;
 		/** The model the friction is raised in now (null: not raised), and the
@@ -189,10 +197,12 @@ private:
 		double			OriginalImp[5] = {};
 	};
 
-	/** A motor's brake as SetMotorBrake would apply it: the model, the joint's
-	 *  dof and the torque it holds with. False when the motor has none (not
-	 *  compiled yet, not a plain force actuator on a hinge or slide). */
-	bool ResolveBrake(FName MotorId, UMjPhysicsEngine*& OutEngine, const mjModel_*& OutModel, int32& OutDofAdr, double& OutTorque) const;
+	/** A motor's brake as SetMotorBrake would apply it: the model, the joint
+	 *  (its id in that model), its dof and the torque it holds with. False
+	 *  when the motor has none (not compiled yet, not a plain force actuator
+	 *  on a hinge or slide). */
+	bool ResolveBrake(FName MotorId, UMjPhysicsEngine*& OutEngine, const mjModel_*& OutModel, int32& OutJoint, int32& OutDofAdr,
+		double& OutTorque) const;
 
 	/** A motor's compiled joint-transmission actuator: its engine, model and
 	 *  id. False before it is compiled, or for another transmission. */

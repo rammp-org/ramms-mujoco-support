@@ -403,6 +403,7 @@ bool FRammsMujocoActuationBackend::SetVelocityDrive(FName MotorId, float TargetR
 		Drive.DofAdr = Model->jnt_dofadr[Joint];
 		Drive.Scale = Transmission->bSlide ? 100.0 : 1.0;
 		Drive.Target = TargetRate;
+		Drive.SinceCommand = 0.0; // given now: StepDrives counts its age from here
 		Drive.Kp = Gains.Kp;
 		Drive.Ki = Gains.Ki;
 		Drive.MaxIntegral = Gains.MaxIntegralTorque;
@@ -532,8 +533,8 @@ void FRammsMujocoActuationBackend::ClearPositionProfile(FName MotorId)
 	}
 }
 
-bool FRammsMujocoActuationBackend::ResolveBrake(FName MotorId, UMjPhysicsEngine*& OutEngine, const mjModel_*& OutModel, int32& OutDofAdr,
-	double& OutTorque) const
+bool FRammsMujocoActuationBackend::ResolveBrake(FName MotorId, UMjPhysicsEngine*& OutEngine, const mjModel_*& OutModel, int32& OutJoint,
+	int32& OutDofAdr, double& OutTorque) const
 {
 	UMjNodeComponent*	 Actuator = ResolveActuator(MotorId);
 	const FTransmission* Transmission = ResolveTransmission(MotorId);
@@ -588,6 +589,7 @@ bool FRammsMujocoActuationBackend::ResolveBrake(FName MotorId, UMjPhysicsEngine*
 	{
 		OutEngine = Engine;
 		OutModel = Model;
+		OutJoint = Joint;
 		OutDofAdr = Model->jnt_dofadr[Joint];
 		OutTorque = Spec.BrakeTorque;
 		return true;
@@ -615,6 +617,7 @@ bool FRammsMujocoActuationBackend::ResolveBrake(FName MotorId, UMjPhysicsEngine*
 	constexpr double UnlimitedHoldNm = 1000.0;
 	OutEngine = Engine;
 	OutModel = Model;
+	OutJoint = Joint;
 	OutDofAdr = Model->jnt_dofadr[Joint];
 	OutTorque = Most > 0.0 ? Most : UnlimitedHoldNm;
 	return true;
@@ -624,18 +627,20 @@ bool FRammsMujocoActuationBackend::HasMotorBrake(FName MotorId) const
 {
 	UMjPhysicsEngine* Engine = nullptr;
 	const mjModel*	  Model = nullptr;
+	int32			  Joint = INDEX_NONE;
 	int32			  DofAdr = INDEX_NONE;
 	double			  Torque = 0.0;
-	return ResolveBrake(MotorId, Engine, Model, DofAdr, Torque);
+	return ResolveBrake(MotorId, Engine, Model, Joint, DofAdr, Torque);
 }
 
 bool FRammsMujocoActuationBackend::SetMotorBrake(FName MotorId, bool bEngaged)
 {
 	UMjPhysicsEngine* Engine = nullptr;
 	const mjModel*	  Model = nullptr;
+	int32			  Joint = INDEX_NONE;
 	int32			  DofAdr = INDEX_NONE;
 	double			  Torque = 0.0;
-	const bool		  bHas = ResolveBrake(MotorId, Engine, Model, DofAdr, Torque);
+	const bool		  bHas = ResolveBrake(MotorId, Engine, Model, Joint, DofAdr, Torque);
 	if (!bEngaged)
 	{
 		if (DriveTable)
@@ -652,14 +657,20 @@ bool FRammsMujocoActuationBackend::SetMotorBrake(FName MotorId, bool bEngaged)
 	{
 		return false;
 	}
-	FDriveTable& Table = EnsureDriveTable(*Engine);
-	FScopeLock	 Lock(&Table.Lock);
+	// The joint's name, for the physics thread to find it again in a model
+	// compiled later (StepBrakes). Read and converted here, on the game thread
+	// and before the lock, so the physics thread never waits on it.
+	const char* const JointNameUtf8 = mj_id2name(Model, mjOBJ_JOINT, Joint);
+	FString			  JointName = JointNameUtf8 ? FString(UTF8_TO_TCHAR(JointNameUtf8)) : FString();
+	FDriveTable&	  Table = EnsureDriveTable(*Engine);
+	FScopeLock		  Lock(&Table.Lock);
 	// A braked wheel is not also driven at a speed.
 	Table.Drives.Remove(MotorId);
 	Table.Articulation = Articulation.Get();
 	FPhysicsBrake& Brake = Table.Brakes.FindOrAdd(MotorId);
 	Brake.Model = Model;
 	Brake.DofAdr = DofAdr;
+	Brake.JointName = MoveTemp(JointName);
 	Brake.Torque = Torque;
 	Brake.bEngaged = true;
 	return true;
@@ -741,7 +752,13 @@ void FRammsMujocoActuationBackend::StepBrakes(FDriveTable& Table, mjModel_* Mode
 	// joint's friction loss raised before the step holds it in that step's
 	// solve: dry friction up to the brake's torque, together with the
 	// contacts, at the physics rate. A brake resolved against another model
-	// (a recompile since) holds nothing until it is set again.
+	// (a recompile since) is bound to this one here, by its joint's name: the
+	// controllers remember that they engaged it and do not set it again, so
+	// one left bound to the old model would hold nothing while they count the
+	// wheel as braked (a robot parked on a slope rolled once a generated
+	// world's recompile finished). A joint that has no name, or is gone or no
+	// longer a hinge or slide in the new model, holds nothing until the brake
+	// is set again.
 	//
 	// The friction is made hard too. MuJoCo's constraints are soft: under a
 	// steady load one slides at about the load times its regulariser over its
@@ -757,6 +774,19 @@ void FRammsMujocoActuationBackend::StepBrakes(FDriveTable& Table, mjModel_* Mode
 	for (auto It = Table.Brakes.CreateIterator(); It; ++It)
 	{
 		FPhysicsBrake& Brake = It.Value();
+		if (Table.bAlive && Brake.bEngaged && Brake.Model != Model)
+		{
+			// Looked up once per recompile: the model is noted either way, and
+			// a joint not found leaves no dof, which the range test below
+			// takes for nothing to hold. What was raised in the old model went
+			// with it (RaisedIn is not this one), so the new model's own
+			// friction and solver parameters are taken afresh below.
+			const int32 Joint = Brake.JointName.IsEmpty() ? -1 : mj_name2id(Model, mjOBJ_JOINT, TCHAR_TO_UTF8(*Brake.JointName));
+			const bool	bFound = Joint >= 0 && Joint < Model->njnt
+				&& (Model->jnt_type[Joint] == mjJNT_HINGE || Model->jnt_type[Joint] == mjJNT_SLIDE);
+			Brake.Model = Model;
+			Brake.DofAdr = bFound ? Model->jnt_dofadr[Joint] : INDEX_NONE;
+		}
 		const bool	   bHold = Table.bAlive && Brake.bEngaged && Brake.Model == Model && Brake.DofAdr >= 0 && Brake.DofAdr < Model->nv;
 		mjtNum* const  Ref = bHold || Brake.RaisedIn == Model ? &Model->dof_solref[Brake.DofAdr * mjNREF] : nullptr;
 		mjtNum* const  Imp = Ref ? &Model->dof_solimp[Brake.DofAdr * mjNIMP] : nullptr;
@@ -894,6 +924,16 @@ void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, mjModel_* Mode
 		{
 			continue;
 		}
+		// The target is the game thread's, given once per tick, while this runs
+		// every physics step: with the game thread stalled and the simulation
+		// free-running (no frame lock) the wheels would go on at the last rate
+		// with no controller or safety check running. A command older than
+		// this, in simulated time, is taken as rest -- a zero-speed hold, the
+		// loop still closed -- until the next one arrives. Dt is 0 while the
+		// simulation is paused, so a pause never ages it.
+		constexpr double StaleCommandSeconds = 0.5;
+		Drive.SinceCommand += Dt;
+		const double Target = Drive.SinceCommand > StaleCommandSeconds ? 0.0 : Drive.Target;
 		const int32	 Id = Drive.ActuatorId;
 		const double Gear = Model->actuator_gear[6 * Id];
 		const bool	 bOurs = Table.Stiffened.Contains(Id);
@@ -940,7 +980,7 @@ void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, mjModel_* Mode
 			// integral in the actuator's force: held while the force is at
 			// its limit, so that it does not wind up.
 			const double Qd = Data->qvel[Drive.DofAdr];
-			const double QdTarget = Drive.Target / Drive.Scale;
+			const double QdTarget = Target / Drive.Scale;
 			double		 Integral = Drive.Integral + StiffKi / Gear * (QdTarget - Qd) * Dt;
 			if (Drive.MaxIntegral > 0.0)
 			{
@@ -988,7 +1028,7 @@ void FRammsMujocoActuationBackend::StepDrives(FDriveTable& Table, mjModel_* Mode
 		}
 		// The same PI the base runs, in the joint's sense: integral capped,
 		// held while the output is saturated so it does not wind up.
-		const double Error = Drive.Target - Data->qvel[Drive.DofAdr] * Drive.Scale;
+		const double Error = Target - Data->qvel[Drive.DofAdr] * Drive.Scale;
 		double		 Integral = Drive.Integral + Drive.Ki * Error * Dt;
 		if (Drive.MaxIntegral > 0.0)
 		{
