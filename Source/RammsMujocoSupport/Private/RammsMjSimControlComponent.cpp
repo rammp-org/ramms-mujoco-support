@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "RammsMjSimControlComponent.h"
+#include "HAL/IConsoleManager.h"
 #include "Kismet/GameplayStatics.h"
 #include "MuJoCo/Core/AMjManager.h"
 #include "MuJoCo/Core/MjArticulation.h"
@@ -115,6 +116,7 @@ namespace
 	const FName SimPause(TEXT("sim.pause"));
 	const FName SimStep(TEXT("sim.step"));
 	const FName SimRunning(TEXT("sim.running"));
+	const FName SimFrameLock(TEXT("sim.frame_lock"));
 	const FName DbgContacts(TEXT("sim.debug.contacts"));
 	const FName DbgVisuals(TEXT("sim.debug.visuals"));
 	const FName DbgCollisions(TEXT("sim.debug.collisions"));
@@ -122,6 +124,33 @@ namespace
 	const FName DbgQuickConvert(TEXT("sim.debug.quick_convert_collisions"));
 	const FName DbgShader(TEXT("sim.debug.shader_mode"));
 	const FName DbgTendons(TEXT("sim.debug.tendons"));
+
+	const FName SimFrameLockState(TEXT("sim.frame_lock.state"));
+
+	// sim.frame_lock: URLab's frame-locked stepping, urlab.LockedFrameSeconds. The choices, in order: off (0),
+	// matched to the frame (below 0: each batch the real time its frame took), and fixed -- 1/16 s (the curb
+	// runner's locked period: 31 steps of 2 ms), or whatever fixed period is already set elsewhere (the console, the
+	// runner), which choosing it keeps. sim.frame_lock.state says in words exactly what is set.
+	constexpr float FrameLockMatched = -1.0f;
+	constexpr float FrameLockFixed = 0.0625f;
+
+	/** URLab's variable; null with a URLab that has no frame lock (the control is then not offered). */
+	IConsoleVariable* FrameLockVariable()
+	{
+		return IConsoleManager::Get().FindConsoleVariable(TEXT("urlab.LockedFrameSeconds"));
+	}
+
+	/** The choice the variable holds now (any fixed period is the fixed choice); -1 without it. */
+	int32 FrameLockChoice()
+	{
+		const IConsoleVariable* Var = FrameLockVariable();
+		if (!Var)
+		{
+			return -1;
+		}
+		const float Seconds = Var->GetFloat();
+		return Seconds == 0.0f ? 0 : (Seconds < 0.0f ? 1 : 2);
+	}
 } // namespace
 
 void URammsMjSimControlComponent::BeginPlay()
@@ -328,6 +357,36 @@ void URammsMjSimControlComponent::DescribeControls(FRammsControlSurface& OutSurf
 	Running.Order = 3;
 	OutSurface.Add(Running);
 
+	if (FrameLockVariable())
+	{
+		// Read back from the variable itself (its value and its target both), so it shows a change from the
+		// console, the curb runner, or URLab turning the lock off after a stalled batch.
+		FRammsControlAxis Lock;
+		Lock.Id = SimFrameLock;
+		Lock.Group = Sim;
+		Lock.DisplayName = FText::FromString(TEXT("Frame lock"));
+		Lock.Kind = ERammsControlKind::Enum;
+		Lock.Units = ERammsControlUnits::None;
+		Lock.EnumLabels = { FText::FromString(TEXT("Off")), FText::FromString(TEXT("Matched")), FText::FromString(TEXT("1/16 s")) };
+		Lock.Range = FVector2D(0.0, 2.0);
+		Lock.DefaultValue = 0.0f;
+		Lock.bReadback = true;
+		Lock.Order = 4;
+		OutSurface.Add(Lock);
+
+		// What is set, in words: the period and its steps, or that it is matched or off.
+		FRammsControlAxis State;
+		State.Id = SimFrameLockState;
+		State.Group = Sim;
+		State.DisplayName = FText::FromString(TEXT("Frame lock is"));
+		State.Kind = ERammsControlKind::Text;
+		State.Units = ERammsControlUnits::None;
+		State.bReadOnly = true;
+		State.Range = FVector2D(0.0, static_cast<double>(ERammsControlTextSeverity::Fault));
+		State.Order = 5;
+		OutSurface.Add(State);
+	}
+
 	if (bExposeDebugToggles && Manager->DebugVisualizer)
 	{
 		const FName Dbg("Sim Debug");
@@ -343,6 +402,23 @@ void URammsMjSimControlComponent::DescribeControls(FRammsControlSurface& OutSurf
 
 bool URammsMjSimControlComponent::ApplyControl(FName Id, float Value)
 {
+	if (Id == SimFrameLock)
+	{
+		IConsoleVariable* Var = FrameLockVariable();
+		if (!Var)
+		{
+			return false;
+		}
+		const int32 Choice = FMath::Clamp(FMath::RoundToInt(Value), 0, 2);
+		if (Choice == 2 && Var->GetFloat() > 0.0f)
+		{
+			return true; // already fixed: the period set elsewhere (the runner's, the console's) stays
+		}
+		// As the console sets it (the highest priority), so the choice holds whoever set it before. It is a console
+		// variable: it lasts beyond this session, as one set from the console does.
+		Var->Set(Choice == 0 ? 0.0f : (Choice == 1 ? FrameLockMatched : FrameLockFixed), ECVF_SetByConsole);
+		return true;
+	}
 	// sim.running is writable too: 1 = run, 0 = pause.
 	AAMjManager* Manager = GetManager();
 	if (Id != SimRunning || !Manager)
@@ -355,6 +431,12 @@ bool URammsMjSimControlComponent::ApplyControl(FName Id, float Value)
 
 bool URammsMjSimControlComponent::TriggerControl(FName Id)
 {
+	if (Id == SimFrameLock)
+	{
+		// The next choice, as an Enum's trigger does: Off -> Matched -> fixed -> Off.
+		const int32 Choice = FrameLockChoice();
+		return Choice >= 0 && ApplyControl(Id, static_cast<float>(Choice == 0 ? 1 : (Choice == 1 ? 2 : 0)));
+	}
 	AAMjManager* Manager = GetManager();
 	if (!Manager)
 	{
@@ -417,6 +499,17 @@ bool URammsMjSimControlComponent::TriggerControl(FName Id)
 
 bool URammsMjSimControlComponent::ReadControl(FName Id, float& OutValue) const
 {
+	if (Id == SimFrameLock)
+	{
+		const int32 Choice = FrameLockChoice();
+		OutValue = static_cast<float>(Choice);
+		return Choice >= 0;
+	}
+	if (Id == SimFrameLockState)
+	{
+		OutValue = static_cast<float>(ERammsControlTextSeverity::Info); // its words are information, never a warning
+		return FrameLockVariable() != nullptr;
+	}
 	AAMjManager* Manager = GetManager();
 	if (Id != SimRunning || !Manager)
 	{
@@ -424,4 +517,44 @@ bool URammsMjSimControlComponent::ReadControl(FName Id, float& OutValue) const
 	}
 	OutValue = Manager->IsRunning() ? 1.0f : 0.0f;
 	return true;
+}
+
+bool URammsMjSimControlComponent::ReadControlText(FName Id, FText& OutText) const
+{
+	if (Id != SimFrameLockState)
+	{
+		return false;
+	}
+	const IConsoleVariable* Var = FrameLockVariable();
+	if (!Var)
+	{
+		return false;
+	}
+	const float	 Seconds = Var->GetFloat();
+	AAMjManager* Manager = GetManager();
+	const double Dt = Manager && Manager->PhysicsEngine ? Manager->PhysicsEngine->GetTimestep() : 0.0;
+	if (Seconds == 0.0f)
+	{
+		OutText = FText::FromString(TEXT("off: MuJoCo runs on its own, paced to the wall clock"));
+	}
+	else if (Seconds < 0.0f)
+	{
+		OutText = FText::FromString(TEXT("matched: each frame's real time, in whole steps"));
+	}
+	else
+	{
+		const FString Period = Seconds == FrameLockFixed ? FString(TEXT("1/16 s")) : FString::Printf(TEXT("%g ms"), Seconds * 1000.0f);
+		OutText = Dt > 0.0
+			? FText::FromString(FString::Printf(TEXT("%s: %d steps of %g ms a frame"), *Period, FMath::Max(1, FMath::RoundToInt(Seconds / Dt)), Dt * 1000.0))
+			: FText::FromString(Period + TEXT(" a frame"));
+	}
+	return true;
+}
+
+bool URammsMjSimControlComponent::ReadTarget(FName Id, float& OutTarget) const
+{
+	// The frame lock's target is whatever the variable holds now: something other than this surface (the console,
+	// the runner, URLab's stall reset) changes it, and a stepper steps from the target. sim.running keeps the
+	// default (no target).
+	return Id == SimFrameLock && ReadControl(Id, OutTarget);
 }
