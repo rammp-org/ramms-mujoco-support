@@ -75,6 +75,7 @@ public:
 	virtual bool   ReleaseMotor(FName MotorId) override { return Active().ReleaseMotor(MotorId); }
 	virtual bool   GetMotorTransform(FName MotorId, FTransform& OutWorld) const override { return Active().GetMotorTransform(MotorId, OutWorld); }
 	virtual double GetSimulationTime() const override { return Active().GetSimulationTime(); }
+	virtual double GetTransformTime() const override { return Active().GetTransformTime(); }
 	virtual bool   SetVelocityDrive(FName MotorId, float TargetRate, const FRammsVelocityGains& Gains,
 		float TorqueMin, float TorqueMax) override;
 	virtual void   ClearVelocityDrive(FName MotorId) override;

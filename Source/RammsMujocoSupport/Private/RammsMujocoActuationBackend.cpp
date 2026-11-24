@@ -1082,6 +1082,23 @@ double FRammsMujocoActuationBackend::GetSimulationTime() const
 	return Time;
 }
 
+double FRammsMujocoActuationBackend::GetTransformTime() const
+{
+	// GetMotorTransform reads a body's component transform, which is the snapshot the manager last APPLIED: at its
+	// own tick, unlocked, whatever was published when the last reader of the frame before asked. GetSimulationTime
+	// is the snapshot published since, which may be most of a frame newer. A speed taken from two poses over the
+	// time between two looks at that clock swings by a quarter from tick to tick; over the time between the two
+	// applied snapshots it is the speed. (Frame-locked the two are the same snapshot.)
+	const UMjPhysicsEngine* Engine = Articulation.IsValid() ? AAMjManager::ResolveEngine(Articulation.Get()) : nullptr;
+	const AAMjManager*		Manager = Engine ? Cast<AAMjManager>(Engine->GetOwner()) : nullptr;
+	if (!Manager || Manager->GetLastAppliedFrameId() == 0)
+	{
+		// Nothing applied yet (or no manager to ask): as the clock.
+		return GetSimulationTime();
+	}
+	return Manager->GetLastAppliedSimTime();
+}
+
 bool FRammsMujocoActuationBackend::ResolveJointActuator(FName MotorId, UMjPhysicsEngine*& OutEngine, const mjModel_*& OutModel,
 	int32& OutActuatorId) const
 {
