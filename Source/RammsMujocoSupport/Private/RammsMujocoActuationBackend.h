@@ -59,6 +59,10 @@ public:
 	/** mjData::time as of the last snapshot the engine stepping this articulation
 	 *  published; negative before the first one. */
 	virtual double GetSimulationTime() const override;
+	/** The time of the snapshot the manager last put on the bodies' components (what GetMotorTransform reads):
+	 *  with the simulation stepping on its own thread that is up to a frame behind GetSimulationTime, by a
+	 *  different amount each tick. */
+	virtual double GetTransformTime() const override;
 	/** Runs the loop in a URLab pre-step callback, every physics step. */
 	virtual bool SetVelocityDrive(FName MotorId, float TargetRate, const FRammsVelocityGains& Gains,
 		float TorqueMin, float TorqueMax) override;
